@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Shared.Repositories;
+using Shared.Utils;
 using StackExchange.Redis;
 
 namespace Shared.Services;
@@ -49,7 +50,7 @@ public sealed class RedisPendingRequestCoordinator : IPendingRequestCoordinator,
         catch (Exception ex)
         {
             _logger.LogWarning(ex,
-                "Failed to check Redis for pending request {RequestId}", requestId);
+                "Failed to check Redis for pending request {RequestId}", LogSanitizer.Sanitize(requestId));
         }
     }
 
@@ -132,7 +133,7 @@ public sealed class RedisPendingRequestCoordinator : IPendingRequestCoordinator,
             if (result?.Response is null)
             {
                 _logger.LogWarning(
-                    "Ignoring invalid pending request result for {RequestId}", requestId);
+                    "Ignoring invalid pending request result for {RequestId}", LogSanitizer.Sanitize(requestId));
                 return;
             }
 
@@ -146,7 +147,7 @@ public sealed class RedisPendingRequestCoordinator : IPendingRequestCoordinator,
         {
             _logger.LogWarning(ex,
                 "Failed to retrieve pending request result from Redis for {RequestId}",
-                requestId);
+                LogSanitizer.Sanitize(requestId));
         }
     }
 

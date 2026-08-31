@@ -1,0 +1,134 @@
+### Variables
+@baseUrl = http://localhost:5005
+@apiVersion = v1
+@tenantId =new-tenant-43
+
+# API Key Authentication
+# The API key must belong to a user with SysAdmin role and start with "sk-Xnai-".
+# SECURITY: Never commit a real API key. Provide it via environment instead.
+#   VS Code REST Client : export ADMIN_API_KEY in your shell, or place it in
+#                         XiansAi.Server.Tests/http/.env (see .env.example).
+#   JetBrains HTTP Client: define ADMIN_API_KEY in http-client.private.env.json
+#                          (gitignored) and reference it as {{ADMIN_API_KEY}}.
+@apiKey = {{$processEnv ADMIN_API_KEY}}
+
+# Note: Replace these with actual values from your database
+# tenantObjectId: MongoDB ObjectId from list tenants response (e.g., "6959f2ffb50bd67dcb893910")
+@tenantObjectId = 695b9043d86f4d3206668f07
+
+### ============================================
+### API Key Authentication
+### ============================================
+# AdminApi uses API key authentication via:
+# 1. Authorization header (preferred): Authorization: Bearer <api-key>
+# (Query parameter ?apikey= is not supported - use Authorization header only)
+#
+# The API key must belong to a user with SysAdmin role.
+# Tenant ID can be provided via:
+# - Query parameter: ?tenantId=<tenant-id>
+# - Route parameter: /tenants/{tenantId}/...
+# - X-Tenant-Id header: X-Tenant-Id: <tenant-id>
+
+### ============================================
+### Tenant Management (No X-Tenant-Id required)
+### ============================================
+
+### 1. List All Tenants (paginated)
+# Get a paginated list of tenants in the system.
+# Supports optional "page" (default 1) and "pageSize" (default 20, max 100) query params.
+# Response shape: { "tenants": [...], "pagination": { page, pageSize, totalPages, totalItems, hasNext, hasPrevious } }
+# Note: No X-Tenant-Id header required for this endpoint
+# API key authentication via Authorization header (preferred method)
+GET {{baseUrl}}/api/{{apiVersion}}/admin/tenants?page=1&pageSize=20
+Authorization: Bearer {{apiKey}}
+Accept: application/json
+
+###
+
+### 2. Get Tenant by ID
+# Get a specific tenant by tenantId (e.g., 'spacex01')
+# Note: No X-Tenant-Id header required for this endpoint
+GET {{baseUrl}}/api/{{apiVersion}}/admin/tenants/{{tenantId}}
+Authorization: Bearer {{apiKey}}
+Accept: application/json
+
+###
+
+### 3. Get Tenant Logo
+# Serves the tenant logo image. This is the endpoint that tenant responses point to
+# via the `logo.url` field (responses never embed the raw base64 image).
+# Returns the decoded image bytes, or a 302 redirect for externally-hosted logos.
+GET {{baseUrl}}/api/{{apiVersion}}/admin/tenants/{{tenantId}}/logo
+Authorization: Bearer {{apiKey}}
+Accept: image/*
+
+###
+
+### 4. Create Tenant
+# Create a new tenant
+# Note: No X-Tenant-Id header required for this endpoint
+POST {{baseUrl}}/api/{{apiVersion}}/admin/tenants
+Authorization: Bearer {{apiKey}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "tenantId": "new-tenant-63",
+  "name": "New Tenant",
+  "domain": "newtenant.example.com",
+  "description": "A new tenant for testing",
+  "enabled": true
+}
+
+###
+
+### 4b. Create Tenant with a base64 logo
+# The logo is accepted as base64 on input, but tenant responses will return a
+# `logo.url` (pointing to the logo endpoint) instead of the embedded base64.
+POST {{baseUrl}}/api/{{apiVersion}}/admin/tenants
+Authorization: Bearer {{apiKey}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "tenantId": "new-tenant-64",
+  "name": "New Tenant With Logo",
+  "domain": "newtenant64.example.com",
+  "description": "A new tenant with a base64 logo",
+  "logo": {
+    "imgBase64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+    "width": 1,
+    "height": 1
+  }
+}
+
+###
+
+### 5. Update Tenant
+# Update tenant properties (name, domain, description, etc.)
+# Note: Uses tenantId (e.g., 'spacex01') in the URL path
+# No X-Tenant-Id header required for this endpoint
+PATCH {{baseUrl}}/api/{{apiVersion}}/admin/tenants/{{tenantId}}
+Authorization: Bearer {{apiKey}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "name": "Updated Tenant Name",
+  "domain": "updated.example.com",
+  "description": "Updated tenant description",
+  "enabled": true,
+  "theme": "dark"
+}
+
+###
+
+### 6. Delete Tenant
+# Delete a tenant by tenantId (e.g., 'spacex01')
+# Note: No X-Tenant-Id header required for this endpoint
+DELETE {{baseUrl}}/api/{{apiVersion}}/admin/tenants/{{tenantId}}
+Authorization: Bearer {{apiKey}}
+Accept: application/json
+
+###
+

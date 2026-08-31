@@ -1,0 +1,1607 @@
+using MongoDB.Driver;
+using MongoDB.Bson;
+using MongoDB.Bson.Serialization.Attributes;
+using System.Text.Json.Serialization;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using Microsoft.Extensions.Caching.Memory;
+using Shared.Data;
+using Shared.Utils;
+using Shared.Auth;
+using Shared.Services;
+
+namespace Shared.Repositories;
+
+// Enums
+public enum MessageDirection
+{
+    Incoming,
+    Outgoing,
+    [Obsolete("Use MessageDirection.Handoff instead")]
+    Handover
+}
+
+public enum MessageStatus
+{
+    FailedToDeliverToWorkflow,
+    DeliveredToWorkflow,
+}
+
+public enum MessageType
+{
+    Chat,
+    Data,
+    File,
+    Handoff,
+    Webhook,
+    /// <summary>
+    /// Reasoning message type for streaming agent thinking/reasoning steps.
+    /// </summary>
+    Reasoning,
+    /// <summary>
+    /// Tool execution message type for streaming tool call steps.
+    /// </summary>
+    Tool,
+    /// <summary>
+    /// Heartbeat message type for frontend liveness checks.
+    /// The frontend sends a heartbeat to verify an agent worker is available.
+    /// No handler is invoked; the workflow responds immediately with available=true.
+    /// </summary>
+    Heartbeat
+}
+
+public enum ConversationThreadStatus
+{
+    Active,
+    Archived
+}
+
+// Message Log Event
+public class MessageLogEvent
+{
+    [BsonElement("timestamp")]
+    public required DateTime Timestamp { get; set; }
+
+    [BsonElement("event")]
+    public required string Event { get; set; }
+
+    [BsonElement("details")]
+    public string? Details { get; set; }
+}
+
+// ConversationMessage model
+[BsonIgnoreExtraElements]
+public class ConversationMessage
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string Id { get; set; } = null!;
+
+    [BsonElement("thread_id")]
+    public required string ThreadId { get; set; }
+
+    [BsonElement("request_id")]
+    public string? RequestId { get; set; }
+
+    [BsonElement("tenant_id")]
+    public required string TenantId { get; set; }
+
+    [BsonElement("created_at")]
+    public required DateTime CreatedAt { get; set; }
+
+    [BsonElement("updated_at")]
+    public DateTime? UpdatedAt { get; set; }
+
+    [BsonElement("created_by")]
+    public required string CreatedBy { get; set; }
+
+    [BsonElement("direction")]
+    [BsonRepresentation(BsonType.String)]
+    [JsonConverter(typeof(JsonStringEnumConverter))]
+    public required MessageDirection Direction { get; set; }
+
+    [BsonElement("text")]
+    public string? Text { get; set; }
+
+    [BsonElement("status")]
+    [BsonRepresentation(BsonType.String)]
+    [JsonConverter(typeof(JsonStringEnumConverter))]
+    public MessageStatus? Status { get; set; }
+
+    [BsonElement("data")]
+    public object? Data { get; set; }
+
+    [BsonElement("participant_id")]
+    public required string ParticipantId { get; set; }
+
+    [BsonElement("scope")]
+    public string? Scope { get; set; }
+
+    [BsonElement("hint")]
+    public string? Hint { get; set; }
+
+    [BsonElement("task_id")]
+    public string? TaskId { get; set; }
+
+    [BsonElement("workflow_id")]
+    public required string WorkflowId { get; set; }
+
+    [BsonElement("workflow_type")]
+    public required string WorkflowType { get; set; }
+
+    [BsonElement("message_type")]
+    [BsonRepresentation(BsonType.String)]
+    [JsonConverter(typeof(JsonStringEnumConverter))]
+    public MessageType? MessageType { get; set; }
+    
+    [BsonElement("origin")]
+    public string? Origin { get; set; }
+
+    /// <summary>
+    /// Optional expiry for TTL. When set, MongoDB automatically deletes the document after this time.
+    /// Used for heartbeat messages (short TTL) to prevent database bloat.
+    /// </summary>
+    [BsonElement("expires_at")]
+    public DateTime? ExpiresAt { get; set; }
+}
+
+// ConversationThread model
+[BsonIgnoreExtraElements]
+public class ConversationThread
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string Id { get; set; } = null!;
+
+    [BsonElement("tenant_id")]
+    public required string TenantId { get; set; }
+
+    [BsonElement("workflow_id")]
+    public required string WorkflowId { get; set; }
+
+    [BsonElement("workflow_type")]
+    public string? WorkflowType { get; set; }
+
+    [BsonElement("agent")]
+    public required string Agent { get; set; }
+
+    [BsonElement("participant_id")]
+    public required string ParticipantId { get; set; }
+
+    [BsonElement("created_at")]
+    public required DateTime CreatedAt { get; set; }
+
+    [BsonElement("updated_at")]
+    public DateTime? UpdatedAt { get; set; }
+
+    [BsonElement("created_by")]
+    public required string CreatedBy { get; set; }
+
+    [BsonElement("status")]
+    [BsonRepresentation(BsonType.String)]
+    public required ConversationThreadStatus Status { get; set; }
+}
+
+/// <summary>
+/// Unified conversation repository that combines thread and message operations
+/// with optimized performance using transactions and atomic operations
+/// </summary>
+public class TopicInfo
+{
+    public string? Scope { get; set; }
+    public int MessageCount { get; set; }
+    public DateTime LastMessageAt { get; set; }
+}
+
+public class TopicsResult
+{
+    public required List<TopicInfo> Topics { get; set; }
+    public required PaginationMetadata Pagination { get; set; }
+}
+
+public class PaginationMetadata
+{
+    public int CurrentPage { get; set; }
+    public int PageSize { get; set; }
+    public int TotalTopics { get; set; }
+    public int TotalPages { get; set; }
+    public bool HasMore { get; set; }
+}
+
+public interface IConversationRepository
+{
+    // Thread operations
+    Task<string> CreateOrGetThreadIdAsync(ConversationThread thread);
+    Task<List<ConversationThread>> GetByTenantAndAgentAsync(string tenantId, string agent, int? page = null, int? pageSize = null);
+    Task<bool> DeleteThreadAsync(string threadId, string? tenantId = null);
+    Task<string> GetThreadIdAsync(string tenantId, string workflowId, string participantId);
+
+
+    // Message operations
+    Task<string> SaveMessageAsync(ConversationMessage message);
+    Task<ConversationMessage?> GetMessageByIdAsync(string messageId, string tenantId);
+    Task<List<ConversationMessage>> GetMessagesByThreadIdAsync(string tenantId, string threadId, int? page = null, int? pageSize = null, string? scope = null, bool chatOnly = false);
+    /// <summary>
+    /// Returns a window of messages around a specific message within a thread: up to
+    /// <paramref name="contextBefore"/> messages immediately before it and up to
+    /// <paramref name="contextAfter"/> messages immediately after it, plus the anchor message itself.
+    /// Results are ordered chronologically (oldest first). Returns an empty list when the anchor
+    /// message is not found in the tenant. The anchor message is always included regardless of
+    /// <paramref name="chatOnly"/>.
+    /// </summary>
+    Task<List<ConversationMessage>> GetThreadContextAroundMessageAsync(string tenantId, string threadId, string messageId, int contextBefore, int contextAfter, bool chatOnly = false);
+    Task<List<ConversationMessage>> GetMessagesByWorkflowAndParticipantAsync(string workflowId, string participantId, int page, int pageSize, string? scope = null, string sortOrder = "desc");
+    Task<bool> DeleteMessagesByThreadIdAsync(string threadId);
+    Task<bool> DeleteMessagesByWorkflowParticipantAndScopeAsync(string tenantId, string workflowId, string participantId, string? scope);
+
+    /// <summary>
+    /// Collects GridFS file ids referenced by File-type messages matching the given
+    /// workflow/participant/scope, so the stored blobs can be cleaned up on delete.
+    /// </summary>
+    Task<List<string>> GetFileIdsByWorkflowParticipantAndScopeAsync(string tenantId, string workflowId, string participantId, string? scope);
+
+    // Topics operations
+    Task<TopicsResult> GetTopicsByThreadIdAsync(string tenantId, string threadId, int page, int pageSize);
+
+
+    // Task ID operations
+    Task<string?> GetLastTaskIdAsync(string tenantId, string workflowId, string participantId, string? scope = null);
+
+    // Origin operations (scope filters by topic - only consider messages in same topic when auto-routing replies)
+    Task<string?> GetLastIncomingOriginAsync(string threadId, string tenantId, string? scope = null);
+    Task<object?> GetLastIncomingDataAsync(string threadId, string tenantId, string? scope = null);
+    /// <summary>
+    /// Gets both the origin and data from the most recent incoming message in a single DB query.
+    /// Use this instead of calling GetLastIncomingOriginAsync + GetLastIncomingDataAsync separately
+    /// to halve the number of MongoDB round-trips on the outgoing message path.
+    /// </summary>
+    Task<(string? Origin, object? Data)> GetLastIncomingOriginAndDataAsync(string threadId, string tenantId, string? scope = null);
+
+    // Statistics operations
+    Task<(int totalMessages, int activeUsers)> GetMessagingStatsAsync(string tenantId, DateTime startDate, DateTime endDate, string? participantId = null);
+
+}
+
+/// <summary>
+/// Optimized thread information structure
+/// </summary>
+public class ConversationThreadInfo
+{
+    public required string Id { get; set; }
+    public required string TenantId { get; set; }
+    public required string WorkflowId { get; set; }
+    public required string WorkflowType { get; set; }
+    public required string ParticipantId { get; set; }
+    public required DateTime CreatedAt { get; set; }
+    public DateTime? UpdatedAt { get; set; }
+    public bool IsNew { get; set; }
+}
+
+public class ConversationRepository : IConversationRepository
+{
+    private const string ThreadIdCacheKeyPrefix = "conversation:thread-id:";
+    private static readonly TimeSpan ThreadIdCacheDuration = TimeSpan.FromMinutes(10);
+
+    private readonly IMongoCollection<ConversationMessage> _messagesCollection;
+    private readonly IMongoCollection<ConversationThread> _threadsCollection;
+    private readonly IMongoDatabase _database;
+    private readonly ILogger<ConversationRepository> _logger;
+    private readonly ITenantContext _tenantContext;
+    private readonly ISecureEncryptionService _encryptionService;
+    private readonly string _uniqueSecret;
+    private readonly IBackgroundTaskService _backgroundTaskService;
+    private readonly IMemoryCache _memoryCache;
+    private readonly IIncomingOriginCache _incomingOriginCache;
+
+    public ConversationRepository(
+        IDatabaseService databaseService, 
+        ILogger<ConversationRepository> logger, 
+        ITenantContext tenantContext,
+        ISecureEncryptionService encryptionService,
+        IConfiguration configuration,
+        IBackgroundTaskService backgroundTaskService,
+        IMemoryCache memoryCache,
+        IIncomingOriginCache incomingOriginCache)
+    {
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _tenantContext = tenantContext ?? throw new ArgumentNullException(nameof(tenantContext));
+        _encryptionService = encryptionService ?? throw new ArgumentNullException(nameof(encryptionService));
+        _backgroundTaskService = backgroundTaskService ?? throw new ArgumentNullException(nameof(backgroundTaskService));
+        _memoryCache = memoryCache ?? throw new ArgumentNullException(nameof(memoryCache));
+        _incomingOriginCache = incomingOriginCache ?? throw new ArgumentNullException(nameof(incomingOriginCache));
+        
+        var database = databaseService.GetDatabaseAsync().GetAwaiter().GetResult();
+        _database = database;
+        _messagesCollection = database.GetCollection<ConversationMessage>("conversation_message");
+        _threadsCollection = database.GetCollection<ConversationThread>("conversation_thread");
+        
+        // Get the unique secret for conversation messages
+        _uniqueSecret = configuration["EncryptionKeys:UniqueSecrets:ConversationMessageKey"] ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(_uniqueSecret))
+        {
+            _logger.LogWarning("EncryptionKeys:UniqueSecrets:ConversationMessageKey is not configured. Using the base secret value.");
+            var baseSecret = configuration["EncryptionKeys:BaseSecret"];
+            if (string.IsNullOrWhiteSpace(baseSecret))
+            {
+                throw new InvalidOperationException("EncryptionKeys:BaseSecret is not configured");
+            }
+            _uniqueSecret = baseSecret;
+        }
+    }
+
+    #region Thread Operations
+
+    public async Task<string> CreateOrGetThreadIdAsync(ConversationThread thread)
+    {
+        var cacheKey = BuildThreadIdCacheKey(thread.TenantId, thread.WorkflowId, thread.ParticipantId);
+        if (_memoryCache.TryGetValue(cacheKey, out string? cachedThreadId) && !string.IsNullOrEmpty(cachedThreadId))
+        {
+            _logger.LogDebug(
+                "Thread id cache hit {ThreadId} for tenantId {TenantId}, workflowId {WorkflowId}, participantId {ParticipantId}",
+                LogSanitizer.Sanitize(cachedThreadId),
+                LogSanitizer.Sanitize(thread.TenantId),
+                LogSanitizer.Sanitize(thread.WorkflowId),
+                LogSanitizer.Sanitize(thread.ParticipantId));
+            return cachedThreadId;
+        }
+
+        var threadId = await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            var existingThread = await GetByCompositeKeyAsync(thread.TenantId, thread.WorkflowId, thread.ParticipantId);
+            if (existingThread != null)
+            {
+                _logger.LogInformation("Found existing thread {ThreadId} for tenantId {TenantId}, workflowId {WorkflowId}, and participantId {ParticipantId}", 
+                    LogSanitizer.Sanitize(existingThread.Id), LogSanitizer.Sanitize(thread.TenantId), LogSanitizer.Sanitize(thread.WorkflowId), LogSanitizer.Sanitize(thread.ParticipantId));
+                return existingThread.Id;
+            }
+
+            thread.CreatedAt = DateTime.UtcNow;
+            thread.UpdatedAt = DateTime.UtcNow;
+
+            try
+            {
+                await _threadsCollection.InsertOneAsync(thread);
+                _logger.LogInformation("Created new thread {ThreadId} for tenantId {TenantId}, workflowId {WorkflowId}, and participantId {ParticipantId}", 
+                    LogSanitizer.Sanitize(thread.Id), LogSanitizer.Sanitize(thread.TenantId), LogSanitizer.Sanitize(thread.WorkflowId), LogSanitizer.Sanitize(thread.ParticipantId));
+                return thread.Id;
+            }
+            catch (MongoWriteException ex) when (ex.WriteError?.Code == 11000)
+            {
+                // Handle duplicate key error - another thread was created concurrently
+                _logger.LogWarning("Duplicate key error when creating thread. Attempting to retrieve existing thread.");
+                existingThread = await GetByCompositeKeyAsync(thread.TenantId, thread.WorkflowId, thread.ParticipantId);
+                if (existingThread != null)
+                {
+                    return existingThread.Id;
+                }
+                throw;
+            }
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "CreateOrGetThreadId");
+
+        CacheThreadId(cacheKey, threadId);
+        return threadId;
+    }
+
+    public async Task<List<ConversationThread>> GetByTenantAndAgentAsync(string tenantId, string agent, int? page = null, int? pageSize = null)
+    {
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            var filter = Builders<ConversationThread>.Filter.And(
+                Builders<ConversationThread>.Filter.Eq(x => x.TenantId, tenantId),
+                Builders<ConversationThread>.Filter.Eq(x => x.Agent, agent)
+            );
+
+            var query = _threadsCollection.Find(filter).Sort(Builders<ConversationThread>.Sort.Descending(x => x.UpdatedAt));
+
+            if (page.HasValue && pageSize.HasValue)
+            {
+                var skip = (page.Value - 1) * pageSize.Value;
+                _logger.LogDebug("Applying pagination: page={Page}, pageSize={PageSize}, skip={Skip}, limit={Limit}", 
+                    page.Value, pageSize.Value, skip, pageSize.Value);
+                query = query.Skip(skip).Limit(pageSize.Value);
+            }
+            else
+            {
+                _logger.LogDebug("No pagination applied: page={Page}, pageSize={PageSize}", page, pageSize);
+            }
+
+            var results = await query.ToListAsync();
+            _logger.LogDebug("GetByTenantAndAgentAsync returned {Count} threads for tenant {TenantId} and agent {Agent}", 
+                results.Count, LogSanitizer.Sanitize(tenantId), LogSanitizer.Sanitize(agent));
+            
+            return results;
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "GetByTenantAndAgent");
+    }
+
+    public async Task<bool> DeleteThreadAsync(string id, string? tenantId = null)
+    {
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            // First check if thread exists
+            var thread = await _threadsCollection.Find(x => x.Id == id).FirstOrDefaultAsync();
+            if (thread == null)
+            {
+                _logger.LogWarning("Thread {ThreadId} not found", LogSanitizer.Sanitize(id));
+                return false;
+            }
+
+            // Validate tenant ownership (skip check if tenantId is null - SysAdmin action)
+            if (tenantId != null && thread.TenantId != tenantId)
+            {
+                _logger.LogWarning("Thread {ThreadId} does not belong to tenant {TenantId}. IDOR attempt detected.", LogSanitizer.Sanitize(id), LogSanitizer.Sanitize(tenantId));
+                return false;
+            }
+
+            // Use transaction to delete thread and its messages atomically
+            using var session = await _database.Client.StartSessionAsync();
+            
+            try
+            {
+                var result = await session.WithTransactionAsync(async (session, cancellationToken) =>
+                {
+                    // Delete all messages in the thread
+                    var messageDeleteResult = await _messagesCollection.DeleteManyAsync(
+                        session, 
+                        Builders<ConversationMessage>.Filter.Eq(m => m.ThreadId, id), 
+                        cancellationToken: cancellationToken);
+                    
+                    _logger.LogInformation("Deleted {MessageCount} messages from thread {ThreadId}", 
+                        messageDeleteResult.DeletedCount, LogSanitizer.Sanitize(id));
+
+                    // Delete the thread
+                    var threadDeleteResult = await _threadsCollection.DeleteOneAsync(
+                        session, 
+                        Builders<ConversationThread>.Filter.Eq(t => t.Id, id), 
+                        cancellationToken: cancellationToken);
+
+                    return threadDeleteResult.DeletedCount > 0;
+                });
+
+                if (result)
+                {
+                    InvalidateThreadIdCache(thread.TenantId, thread.WorkflowId, thread.ParticipantId);
+                    _incomingOriginCache.InvalidateThread(id);
+                }
+
+                return result;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error deleting thread {ThreadId}", LogSanitizer.Sanitize(id));
+                throw;
+            }
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "DeleteThread");
+    }
+
+    #endregion
+
+    #region Message Operations
+
+    public async Task<string> SaveMessageAsync(ConversationMessage message)
+    {
+        var now = DateTime.UtcNow;
+        message.CreatedAt = now;
+        message.UpdatedAt = now;
+        
+        // Encrypt the Text property if it's not null or empty
+        if (!string.IsNullOrEmpty(message.Text))
+        {
+            try
+            {
+                // Use a combination of tenant ID and message ID as the unique secret
+                var messageSpecificSecret = $"{_uniqueSecret}";
+                message.Text = _encryptionService.Encrypt(message.Text, messageSpecificSecret);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to encrypt message text for message {MessageId}", LogSanitizer.Sanitize(message.Id));
+                throw new InvalidOperationException("Failed to encrypt message text", ex);
+            }
+        }
+        
+        // Convert data to BsonDocument if needed
+        if (message.Data != null)
+        {
+            message.Data = ConvertToBsonDocument(message.Data);
+        }
+
+        // Insert message directly (no transaction needed — message insert is idempotent via ObjectId).
+        // The thread timestamp update is cosmetic (UI sort order) and does not need to be atomic
+        // with the message insert; decoupling it to a background queue removes 3 extra MongoDB
+        // round-trips (BeginTx / UpdateOne / CommitTx) from the hot request path.
+        await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            await _messagesCollection.InsertOneAsync(message);
+        }, _logger, operationName: "InsertMessage");
+
+        // Update thread timestamp in the background — non-critical for message delivery correctness.
+        var threadId = message.ThreadId;
+        var threadsCollection = _threadsCollection;
+        _backgroundTaskService.QueueDatabaseOperation(async () =>
+        {
+            var threadFilter = Builders<ConversationThread>.Filter.Eq(t => t.Id, threadId);
+            var threadUpdate = Builders<ConversationThread>.Update.Set(t => t.UpdatedAt, now);
+            await threadsCollection.UpdateOneAsync(threadFilter, threadUpdate);
+        });
+
+        return message.Id;
+    }
+
+    public async Task<ConversationMessage?> GetMessageByIdAsync(string messageId, string tenantId)
+    {
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            var messageFilter = Builders<ConversationMessage>.Filter.And(
+                Builders<ConversationMessage>.Filter.Eq(x => x.Id, messageId),
+                Builders<ConversationMessage>.Filter.Eq(x => x.TenantId, tenantId));
+
+            var projection = Builders<ConversationMessage>.Projection
+                .Include(x => x.Id)
+                .Include(x => x.ThreadId)
+                .Include(x => x.TenantId)
+                .Include(x => x.ParticipantId)
+                .Include(x => x.WorkflowId)
+                .Include(x => x.WorkflowType)
+                .Include(x => x.CreatedAt)
+                .Include(x => x.UpdatedAt)
+                .Include(x => x.CreatedBy)
+                .Include(x => x.Direction)
+                .Include(x => x.MessageType)
+                .Include(x => x.Text)
+                .Include(x => x.Data)
+                .Include(x => x.Status)
+                .Include(x => x.Hint)
+                .Include(x => x.TaskId)
+                .Include(x => x.Scope)
+                .Include(x => x.RequestId)
+                .Include(x => x.Origin);
+
+            var message = await _messagesCollection
+                .Find(messageFilter)
+                .Project<ConversationMessage>(projection)
+                .FirstOrDefaultAsync();
+
+            if (message == null)
+            {
+                return null;
+            }
+
+            ConvertBsonDataToObject(message);
+            DecryptMessageText(message);
+            return message;
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "GetMessageById");
+    }
+
+    public async Task<List<ConversationMessage>> GetMessagesByThreadIdAsync(
+string tenantId, string threadId, int? page = null, int? pageSize = null, string? scope = null, bool chatOnly = false)
+    {
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            // Build message filter
+            var messageFilter = Builders<ConversationMessage>.Filter.And(
+                Builders<ConversationMessage>.Filter.Eq(x => x.TenantId, tenantId),
+                Builders<ConversationMessage>.Filter.Eq(x => x.ThreadId, threadId)
+            );
+
+            // Handle scope filtering:
+            // - If scope is not provided (null): return all messages (no filtering)
+            // - If scope is empty string: return only messages with null scope
+            // - If scope has a value: return only messages with that exact scope
+            if (scope != null)
+            {
+                if (string.IsNullOrEmpty(scope))
+                {
+                    _logger.LogDebug("Filtering messages with no scope (null)");
+                    messageFilter = Builders<ConversationMessage>.Filter.And(
+                        messageFilter,
+                        Builders<ConversationMessage>.Filter.Eq(x => x.Scope, null));
+                }
+                else
+                {
+                    _logger.LogDebug("Filtering messages by scope `{Scope}`", LogSanitizer.Sanitize(scope));
+                    messageFilter = Builders<ConversationMessage>.Filter.And(
+                        messageFilter, 
+                        Builders<ConversationMessage>.Filter.Eq(x => x.Scope, scope));
+                }
+            }
+
+            if (chatOnly)
+            {
+                messageFilter = Builders<ConversationMessage>.Filter.And(
+                    messageFilter, 
+                    Builders<ConversationMessage>.Filter.Eq(x => x.MessageType, MessageType.Chat));
+            }
+
+            var query = _messagesCollection.Find(messageFilter)
+                .Sort(Builders<ConversationMessage>.Sort.Descending(x => x.CreatedAt));
+
+            if (page.HasValue && pageSize.HasValue)
+            {
+                var skip = (page.Value - 1) * pageSize.Value;
+                _logger.LogDebug("Applying pagination to messages: page={Page}, pageSize={PageSize}, skip={Skip}, limit={Limit}", 
+                    page.Value, pageSize.Value, skip, pageSize.Value);
+                query = query.Skip(skip).Limit(pageSize.Value);
+            }
+            else
+            {
+                _logger.LogDebug("No pagination applied to messages: page={Page}, pageSize={PageSize}", page, pageSize);
+            }
+
+            // Project only the fields we need
+            var projection = Builders<ConversationMessage>.Projection
+                .Include(x => x.Id)
+                .Include(x => x.ThreadId)
+                .Include(x => x.TenantId)
+                .Include(x => x.ParticipantId)
+                .Include(x => x.WorkflowId)
+                .Include(x => x.WorkflowType)
+                .Include(x => x.CreatedAt)
+                .Include(x => x.UpdatedAt)
+                .Include(x => x.CreatedBy)
+                .Include(x => x.Direction)
+                .Include(x => x.MessageType)
+                .Include(x => x.Text)
+                .Include(x => x.Data)
+                .Include(x => x.Status)
+                .Include(x => x.Hint)
+                .Include(x => x.TaskId)
+                .Include(x => x.Scope)
+                .Include(x => x.RequestId)
+                .Include(x => x.Origin);
+
+            var messages = await query.Project<ConversationMessage>(projection).ToListAsync();
+            
+            // Convert BSON data back to objects and decrypt text
+            foreach (var message in messages)
+            {
+                ConvertBsonDataToObject(message);
+                DecryptMessageText(message);
+            }
+            
+            _logger.LogDebug("Found history of {Count} messages for thread {ThreadId}", messages.Count, LogSanitizer.Sanitize(threadId));
+            return messages;
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "GetMessagesByThreadId");
+    }
+
+    public async Task<List<ConversationMessage>> GetThreadContextAroundMessageAsync(
+        string tenantId, string threadId, string messageId, int contextBefore, int contextAfter, bool chatOnly = false)
+    {
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            var projection = BuildMessageProjection();
+            var filterBuilder = Builders<ConversationMessage>.Filter;
+
+            // Fetch the anchor message (without decrypting yet — decryption happens once at the end).
+            var anchor = await _messagesCollection
+                .Find(filterBuilder.And(
+                    filterBuilder.Eq(x => x.Id, messageId),
+                    filterBuilder.Eq(x => x.TenantId, tenantId),
+                    filterBuilder.Eq(x => x.ThreadId, threadId)))
+                .Project<ConversationMessage>(projection)
+                .FirstOrDefaultAsync();
+
+            if (anchor == null)
+            {
+                _logger.LogWarning(
+                    "Anchor message {MessageId} not found in thread {ThreadId} for tenant {TenantId}",
+                    LogSanitizer.Sanitize(messageId), LogSanitizer.Sanitize(threadId), LogSanitizer.Sanitize(tenantId));
+                return new List<ConversationMessage>();
+            }
+
+            var baseFilter = filterBuilder.And(
+                filterBuilder.Eq(x => x.TenantId, tenantId),
+                filterBuilder.Eq(x => x.ThreadId, threadId));
+
+            if (chatOnly)
+            {
+                baseFilter = filterBuilder.And(baseFilter,
+                    filterBuilder.Eq(x => x.MessageType, MessageType.Chat));
+            }
+
+            // Messages immediately before the anchor: newest-first, then reversed to chronological order.
+            var beforeMessages = new List<ConversationMessage>();
+            if (contextBefore > 0)
+            {
+                beforeMessages = await _messagesCollection
+                    .Find(filterBuilder.And(baseFilter, filterBuilder.Lt(x => x.CreatedAt, anchor.CreatedAt)))
+                    .Project<ConversationMessage>(projection)
+                    .Sort(Builders<ConversationMessage>.Sort.Descending(x => x.CreatedAt))
+                    .Limit(contextBefore)
+                    .ToListAsync();
+                beforeMessages.Reverse();
+            }
+
+            // Messages immediately after the anchor: oldest-first.
+            var afterMessages = new List<ConversationMessage>();
+            if (contextAfter > 0)
+            {
+                afterMessages = await _messagesCollection
+                    .Find(filterBuilder.And(baseFilter, filterBuilder.Gt(x => x.CreatedAt, anchor.CreatedAt)))
+                    .Project<ConversationMessage>(projection)
+                    .Sort(Builders<ConversationMessage>.Sort.Ascending(x => x.CreatedAt))
+                    .Limit(contextAfter)
+                    .ToListAsync();
+            }
+
+            var result = new List<ConversationMessage>(beforeMessages.Count + 1 + afterMessages.Count);
+            result.AddRange(beforeMessages);
+            result.Add(anchor);
+            result.AddRange(afterMessages);
+
+            foreach (var message in result)
+            {
+                ConvertBsonDataToObject(message);
+                DecryptMessageText(message);
+            }
+
+            _logger.LogDebug(
+                "Built thread context of {Count} messages around message {MessageId} in thread {ThreadId}",
+                result.Count, LogSanitizer.Sanitize(messageId), LogSanitizer.Sanitize(threadId));
+
+            return result;
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "GetThreadContextAroundMessage");
+    }
+
+    public async Task<List<ConversationMessage>> GetMessagesByWorkflowAndParticipantAsync(
+        string workflowId, string participantId, int page, int pageSize, string? scope = null, string sortOrder = "desc")
+    {
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            // Single optimized query using compound index
+            var filterBuilder = Builders<ConversationMessage>.Filter;
+            var filter = filterBuilder.And(
+                filterBuilder.Eq(x => x.TenantId, _tenantContext.TenantId),
+                filterBuilder.Eq(x => x.WorkflowId, workflowId),
+                filterBuilder.Eq(x => x.ParticipantId, participantId)
+            );
+
+            // Handle scope filtering:
+            // - If scope is not provided (null) or empty string: return only messages with null scope
+            // - If scope has a value: return only messages with that exact scope
+            if (string.IsNullOrEmpty(scope))
+            {
+                _logger.LogDebug("Filtering messages with no scope (null) for workflowId {WorkflowId}", LogSanitizer.Sanitize(workflowId));
+                filter = filterBuilder.And(filter, filterBuilder.Eq(x => x.Scope, null));
+            }
+            else
+            {
+                _logger.LogDebug("Filtering messages by scope `{Scope}` for workflowId {WorkflowId}", LogSanitizer.Sanitize(scope), LogSanitizer.Sanitize(workflowId));
+                filter = filterBuilder.And(filter, filterBuilder.Eq(x => x.Scope, scope));
+            }
+
+            // Optimized projection for better memory usage
+            var projection = Builders<ConversationMessage>.Projection
+                .Include(x => x.Id)
+                .Include(x => x.ThreadId)
+                .Include(x => x.TenantId)
+                .Include(x => x.ParticipantId)
+                .Include(x => x.WorkflowId)
+                .Include(x => x.WorkflowType)
+                .Include(x => x.CreatedAt)
+                .Include(x => x.UpdatedAt)
+                .Include(x => x.CreatedBy)
+                .Include(x => x.Direction)
+                .Include(x => x.MessageType)
+                .Include(x => x.Text)
+                .Include(x => x.Data)
+                .Include(x => x.Status)
+                .Include(x => x.Hint)
+                .Include(x => x.TaskId)
+                .Include(x => x.Scope)
+                .Include(x => x.RequestId)
+                .Include(x => x.Origin);
+
+            // Apply sort order based on parameter
+            var sort = sortOrder.ToLowerInvariant() == "asc" 
+                ? Builders<ConversationMessage>.Sort.Ascending(x => x.CreatedAt)
+                : Builders<ConversationMessage>.Sort.Descending(x => x.CreatedAt);
+
+            var messages = await _messagesCollection
+                .Find(filter)
+                .Project<ConversationMessage>(projection)
+                .Sort(sort)
+                .Skip((page - 1) * pageSize)
+                .Limit(pageSize)
+                .ToListAsync();
+
+            // Convert BSON data efficiently and decrypt text
+            foreach (var message in messages)
+            {
+                ConvertBsonDataToObject(message);
+                DecryptMessageText(message);
+            }
+
+            return messages;
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "GetMessagesByWorkflowAndParticipant");
+    }
+
+    public async Task<bool> DeleteMessagesByThreadIdAsync(string threadId)
+    {
+        try
+        {
+            var filter = Builders<ConversationMessage>.Filter.And(
+                Builders<ConversationMessage>.Filter.Eq(x => x.ThreadId, threadId)
+            );
+
+            var result = await MongoRetryHelper.ExecuteWithRetryAsync(
+                async () => await _messagesCollection.DeleteManyAsync(filter),
+                _logger,
+                operationName: "DeleteMessagesByThreadId");
+
+            // The auto-populated reply origin is derived from these messages, so it is now stale.
+            _incomingOriginCache.InvalidateThread(threadId);
+
+            _logger.LogInformation("Deleted {DeletedCount} messages for thread {ThreadId}", 
+                result.DeletedCount, LogSanitizer.Sanitize(threadId));
+            
+            return result.DeletedCount >= 0; // Return true even if no messages were found
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error deleting messages for thread {ThreadId}", LogSanitizer.Sanitize(threadId));
+            throw;
+        }
+    }
+
+    public async Task<List<string>> GetFileIdsByWorkflowParticipantAndScopeAsync(string tenantId, string workflowId, string participantId, string? scope)
+    {
+        var fileIds = new List<string>();
+
+        string threadId;
+        try
+        {
+            threadId = await GetThreadIdAsync(tenantId, workflowId, participantId);
+        }
+        catch (KeyNotFoundException)
+        {
+            return fileIds;
+        }
+
+        // Query the raw documents so we can walk the free-form "data" sub-document.
+        var bsonCollection = _database.GetCollection<BsonDocument>("conversation_message");
+        var filter = new BsonDocument
+        {
+            { "thread_id", threadId },
+            { "tenant_id", tenantId },
+            { "message_type", "File" },
+            { "scope", scope == null ? BsonNull.Value : scope },
+        };
+        var projection = Builders<BsonDocument>.Projection.Include("data");
+
+        var docs = await MongoRetryHelper.ExecuteWithRetryAsync(
+            async () => await (await bsonCollection.FindAsync(filter, new FindOptions<BsonDocument> { Projection = projection })).ToListAsync(),
+            _logger,
+            operationName: "GetFileIdsByWorkflowParticipantAndScope");
+
+        foreach (var doc in docs)
+        {
+            if (!doc.TryGetValue("data", out var dataVal) || dataVal is not BsonDocument dataDoc)
+            {
+                continue;
+            }
+            if (!dataDoc.TryGetValue("files", out var filesVal) || filesVal is not BsonArray filesArr)
+            {
+                continue;
+            }
+            foreach (var f in filesArr)
+            {
+                if (f is BsonDocument fd && fd.TryGetValue("fileId", out var idVal) && idVal.IsString)
+                {
+                    fileIds.Add(idVal.AsString);
+                }
+            }
+        }
+
+        return fileIds;
+    }
+
+    public async Task<bool> DeleteMessagesByWorkflowParticipantAndScopeAsync(string tenantId, string workflowId, string participantId, string? scope)
+    {
+        try
+        {
+            // First, get the thread ID
+            string threadId;
+            try
+            {
+                threadId = await GetThreadIdAsync(tenantId, workflowId, participantId);
+            }
+            catch (KeyNotFoundException)
+            {
+                _logger.LogWarning("Thread not found for workflowId {WorkflowId}, participant {ParticipantId}, tenant {TenantId}. No messages to delete.", 
+                    LogSanitizer.Sanitize(workflowId), LogSanitizer.Sanitize(participantId), LogSanitizer.Sanitize(tenantId));
+                return true; // Consider success if thread doesn't exist
+            }
+
+            // Build filter for messages with specific scope (or null scope)
+            var filters = new List<FilterDefinition<ConversationMessage>>
+            {
+                Builders<ConversationMessage>.Filter.Eq(x => x.ThreadId, threadId),
+                Builders<ConversationMessage>.Filter.Eq(x => x.TenantId, tenantId)
+            };
+
+            // Add scope filter - handle null scope explicitly
+            if (scope == null)
+            {
+                filters.Add(Builders<ConversationMessage>.Filter.Eq(x => x.Scope, null));
+            }
+            else
+            {
+                filters.Add(Builders<ConversationMessage>.Filter.Eq(x => x.Scope, scope));
+            }
+
+            var filter = Builders<ConversationMessage>.Filter.And(filters);
+
+            var result = await MongoRetryHelper.ExecuteWithRetryAsync(
+                async () => await _messagesCollection.DeleteManyAsync(filter),
+                _logger,
+                operationName: "DeleteMessagesByWorkflowParticipantAndScope");
+
+            // Only this scope lost its messages, so only its auto-populated reply origin is stale.
+            _incomingOriginCache.InvalidateScope(tenantId, threadId, scope);
+
+            _logger.LogInformation("Deleted {DeletedCount} messages for workflowId {WorkflowId}, participant {ParticipantId}, scope {Scope}", 
+                result.DeletedCount, LogSanitizer.Sanitize(workflowId), LogSanitizer.Sanitize(participantId), LogSanitizer.Sanitize(scope ?? "null"));
+            
+            return result.DeletedCount >= 0; // Return true even if no messages were found
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error deleting messages for workflowId {WorkflowId}, participant {ParticipantId}, scope {Scope}", 
+                LogSanitizer.Sanitize(workflowId), LogSanitizer.Sanitize(participantId), LogSanitizer.Sanitize(scope ?? "null"));
+            throw;
+        }
+    }
+
+    public async Task<string> GetThreadIdAsync(string tenantId, string workflowId, string participantId)
+    {
+        var cacheKey = BuildThreadIdCacheKey(tenantId, workflowId, participantId);
+        if (_memoryCache.TryGetValue(cacheKey, out string? cachedThreadId) && !string.IsNullOrEmpty(cachedThreadId))
+        {
+            return cachedThreadId;
+        }
+
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            var thread = await GetByCompositeKeyAsync(tenantId, workflowId, participantId);
+            if (thread == null)
+            {
+                throw new KeyNotFoundException($"No conversation thread found for tenant '{tenantId}', workflow '{workflowId}', and participant '{participantId}'.");
+            }
+            CacheThreadId(cacheKey, thread.Id);
+            return thread.Id;
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "GetThreadId");
+    }
+
+    public async Task<TopicsResult> GetTopicsByThreadIdAsync(string tenantId, string threadId, int page, int pageSize)
+    {
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            
+            _logger.LogDebug("Getting topics for thread {ThreadId}, page={Page}, pageSize={PageSize}", 
+                threadId, page, pageSize);
+
+            var skip = (page - 1) * pageSize;
+
+            // OPTIMIZATION: Single aggregation using $facet to get count and data in one query
+            // This eliminates the need for two separate aggregations, cutting query time in half
+            var pipeline = new[]
+            {
+                // Match documents for this thread
+                new BsonDocument("$match", new BsonDocument
+                {
+                    { "tenant_id", tenantId },
+                    { "thread_id", threadId }
+                }),
+                // Group by scope to get topic statistics
+                new BsonDocument("$group", new BsonDocument
+                {
+                    { "_id", "$scope" },
+                    { "message_count", new BsonDocument("$sum", 1) },
+                    { "last_message_at", new BsonDocument("$max", "$created_at") }
+                }),
+                // Use $facet to get both count and paginated data in single pass
+                new BsonDocument("$facet", new BsonDocument
+                {
+                    // Count total topics
+                    { "totalCount", new BsonArray
+                        {
+                            new BsonDocument("$count", "count")
+                        }
+                    },
+                    // Get paginated topic data
+                    { "data", new BsonArray
+                        {
+                            new BsonDocument("$sort", new BsonDocument
+                            {
+                                { "last_message_at", -1 },  // Most recent first
+                                { "_id", 1 }                  // Stable sort by scope name
+                            }),
+                            new BsonDocument("$skip", skip),
+                            new BsonDocument("$limit", pageSize)
+                        }
+                    }
+                })
+            };
+
+            // OPTIMIZATION: AllowDiskUse prevents memory errors on large datasets
+            // OPTIMIZATION: MaxTime prevents runaway queries
+            var aggregateOptions = new AggregateOptions 
+            { 
+                AllowDiskUse = true,
+                MaxTime = TimeSpan.FromSeconds(30)
+            };
+
+            var result = await _messagesCollection
+                .Aggregate<BsonDocument>(pipeline, aggregateOptions)
+                .FirstOrDefaultAsync();
+
+            // Extract count from facet result
+            var totalTopics = 0;
+            if (result != null && result.Contains("totalCount"))
+            {
+                var countArray = result["totalCount"].AsBsonArray;
+                if (countArray.Count > 0)
+                {
+                    totalTopics = countArray[0]["count"].ToInt32();
+                }
+            }
+
+            // Extract data from facet result
+            var dataArray = result?["data"]?.AsBsonArray ?? new BsonArray();
+            var topics = dataArray.Select(doc => new TopicInfo
+            {
+                Scope = doc["_id"].IsBsonNull ? null : doc["_id"].AsString,
+                MessageCount = doc["message_count"].ToInt32(),
+                LastMessageAt = doc["last_message_at"].ToUniversalTime()
+            }).ToList();
+
+            // Calculate pagination metadata
+            var totalPages = totalTopics > 0 ? (int)Math.Ceiling((double)totalTopics / pageSize) : 0;
+            var hasMore = page < totalPages;
+
+            stopwatch.Stop();
+            
+            _logger.LogDebug("Found {Count} topics for thread {ThreadId} (page {Page} of {TotalPages}) in {Duration}ms", 
+                topics.Count, threadId, page, totalPages, stopwatch.ElapsedMilliseconds);
+
+            // Log slow queries for monitoring
+            if (stopwatch.ElapsedMilliseconds > 1000)
+            {
+                _logger.LogWarning("SLOW QUERY: Topics aggregation took {Duration}ms for thread {ThreadId}, page {Page}",
+                    stopwatch.ElapsedMilliseconds, threadId, page);
+            }
+
+            return new TopicsResult
+            {
+                Topics = topics,
+                Pagination = new PaginationMetadata
+                {
+                    CurrentPage = page,
+                    PageSize = pageSize,
+                    TotalTopics = totalTopics,
+                    TotalPages = totalPages,
+                    HasMore = hasMore
+                }
+            };
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "GetTopicsByThreadId");
+    }
+
+    public async Task<string?> GetLastIncomingOriginAsync(string threadId, string tenantId, string? scope = null)
+    {
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            var filterBuilder = Builders<ConversationMessage>.Filter;
+            var filterConditions = new List<FilterDefinition<ConversationMessage>>
+            {
+                filterBuilder.Eq(x => x.ThreadId, threadId),
+                filterBuilder.Eq(x => x.TenantId, tenantId),
+                filterBuilder.Eq(x => x.Direction, MessageDirection.Incoming),
+                filterBuilder.Ne(x => x.Origin, null),
+                filterBuilder.Ne(x => x.Origin, "")
+            };
+
+            // Filter by scope so we only use origin from the same topic (prevents web replies going to Slack/Teams)
+            AddScopeFilter(filterBuilder, filterConditions, scope);
+
+            var filter = filterBuilder.And(filterConditions);
+
+            // Get the most recent incoming message with an origin
+            var projection = Builders<ConversationMessage>.Projection.Include(x => x.Origin);
+            
+            var message = await _messagesCollection
+                .Find(filter)
+                .Project<ConversationMessage>(projection)
+                .Sort(Builders<ConversationMessage>.Sort.Descending(x => x.CreatedAt))
+                .Limit(1)
+                .FirstOrDefaultAsync();
+
+            _logger.LogDebug("Last incoming origin for thread {ThreadId} scope {Scope}: {Origin}",
+                LogSanitizer.Sanitize(threadId), LogSanitizer.Sanitize(scope ?? "null"), LogSanitizer.Sanitize(message?.Origin ?? "none"));
+
+            return message?.Origin;
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "GetLastIncomingOrigin");
+    }
+
+    public async Task<object?> GetLastIncomingDataAsync(string threadId, string tenantId, string? scope = null)
+    {
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            var filterBuilder = Builders<ConversationMessage>.Filter;
+            var filterConditions = new List<FilterDefinition<ConversationMessage>>
+            {
+                filterBuilder.Eq(x => x.ThreadId, threadId),
+                filterBuilder.Eq(x => x.TenantId, tenantId),
+                filterBuilder.Eq(x => x.Direction, MessageDirection.Incoming),
+                filterBuilder.Ne(x => x.Data, null)
+            };
+
+            // Filter by scope so we only use data from the same topic (prevents web replies going to Slack/Teams)
+            AddScopeFilter(filterBuilder, filterConditions, scope);
+
+            var filter = filterBuilder.And(filterConditions);
+
+            // Get the most recent incoming message with data
+            var projection = Builders<ConversationMessage>.Projection.Include(x => x.Data);
+            
+            var message = await _messagesCollection
+                .Find(filter)
+                .Project<ConversationMessage>(projection)
+                .Sort(Builders<ConversationMessage>.Sort.Descending(x => x.CreatedAt))
+                .Limit(1)
+                .FirstOrDefaultAsync();
+
+            _logger.LogDebug("Last incoming data for thread {ThreadId} scope {Scope}: {HasData}",
+                LogSanitizer.Sanitize(threadId), LogSanitizer.Sanitize(scope ?? "null"), message?.Data != null ? "yes" : "none");
+
+            return message?.Data;
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "GetLastIncomingData");
+    }
+
+    public async Task<(string? Origin, object? Data)> GetLastIncomingOriginAndDataAsync(string threadId, string tenantId, string? scope = null)
+    {
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            var filterBuilder = Builders<ConversationMessage>.Filter;
+            // Accept messages that have either an origin or data (inclusive — the caller decides which fields to use)
+            var filterConditions = new List<FilterDefinition<ConversationMessage>>
+            {
+                filterBuilder.Eq(x => x.ThreadId, threadId),
+                filterBuilder.Eq(x => x.TenantId, tenantId),
+                filterBuilder.Eq(x => x.Direction, MessageDirection.Incoming)
+            };
+
+            AddScopeFilter(filterBuilder, filterConditions, scope);
+            var filter = filterBuilder.And(filterConditions);
+
+            // Project both origin and data in a single round-trip
+            var projection = Builders<ConversationMessage>.Projection
+                .Include(x => x.Origin)
+                .Include(x => x.Data);
+
+            var message = await _messagesCollection
+                .Find(filter)
+                .Project<ConversationMessage>(projection)
+                .Sort(Builders<ConversationMessage>.Sort.Descending(x => x.CreatedAt))
+                .Limit(1)
+                .FirstOrDefaultAsync();
+
+            var origin = string.IsNullOrEmpty(message?.Origin) ? null : message.Origin;
+            object? data = null;
+            if (message?.Data != null)
+            {
+                ConvertBsonDataToObject(message);
+                data = message.Data;
+            }
+
+            _logger.LogDebug("Last incoming origin+data for thread {ThreadId} scope {Scope}: origin={Origin}, hasData={HasData}",
+                LogSanitizer.Sanitize(threadId), LogSanitizer.Sanitize(scope ?? "null"), LogSanitizer.Sanitize(origin ?? "none"), data != null ? "yes" : "no");
+
+            return (origin, data);
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "GetLastIncomingOriginAndData");
+    }
+
+        /// <summary>
+    /// Adds scope filter to match messages in the same topic.
+    /// - When scope is null or whitespace: restricts to messages where Scope is null or "" (default topic).
+    /// - When scope has a value: restricts to messages with that exact scope.
+    /// All callers (GetLastIncomingOriginAsync, GetLastIncomingDataAsync, GetLastTaskIdAsync) use this for topic-scoped lookups.
+    /// MessageService passes null for default chat, so null correctly filters to default scope.
+    /// </summary>
+    private static void AddScopeFilter(
+        FilterDefinitionBuilder<ConversationMessage> filterBuilder,
+        List<FilterDefinition<ConversationMessage>> filterConditions,
+        string? scope)
+    {
+        if (string.IsNullOrWhiteSpace(scope))
+        {
+            filterConditions.Add(filterBuilder.Or(
+                filterBuilder.Eq(x => x.Scope, null),
+                filterBuilder.Eq(x => x.Scope, "")));
+        }
+        else
+        {
+            filterConditions.Add(filterBuilder.Eq(x => x.Scope, scope.Trim()));
+        }
+    }
+
+
+    public async Task<string?> GetLastTaskIdAsync(string tenantId, string workflowId, string participantId, string? scope = null)
+    {
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            var filterBuilder = Builders<ConversationMessage>.Filter;
+            // Match exact workflow_id or full Temporal run id (workflow_id starting with workflowId + ":")
+            var workflowFilter = filterBuilder.Or(
+                filterBuilder.Eq(x => x.WorkflowId, workflowId),
+                filterBuilder.Regex(x => x.WorkflowId, new BsonRegularExpression("^" + Regex.Escape(workflowId) + ":"))
+            );
+            var filter = filterBuilder.And(
+                filterBuilder.Eq(x => x.TenantId, tenantId),
+                workflowFilter,
+                filterBuilder.Eq(x => x.ParticipantId, participantId),
+                filterBuilder.Ne(x => x.TaskId, null),
+                filterBuilder.Ne(x => x.TaskId, "")
+            );
+
+            if (scope != null)
+            {
+                if (string.IsNullOrEmpty(scope))
+                {
+                    _logger.LogDebug("Filtering messages with no scope (null) for last task id");
+                    filter = filterBuilder.And(filter, filterBuilder.Eq(x => x.Scope, null));
+                }
+                else
+                {
+                    _logger.LogDebug("Filtering messages by scope `{Scope}` for last task id", LogSanitizer.Sanitize(scope));
+                    filter = filterBuilder.And(filter, filterBuilder.Eq(x => x.Scope, scope));
+                }
+            }
+
+            var projection = Builders<ConversationMessage>.Projection.Include(x => x.TaskId);
+
+            var message = await _messagesCollection
+                .Find(filter)
+                .Project<ConversationMessage>(projection)
+                .Sort(Builders<ConversationMessage>.Sort.Descending(x => x.CreatedAt))
+                .Limit(1)
+                .FirstOrDefaultAsync();
+
+            _logger.LogDebug("Last task id for workflow {WorkflowId}, participant {ParticipantId}, scope {Scope}: {TaskId}",
+                LogSanitizer.Sanitize(workflowId), LogSanitizer.Sanitize(participantId), LogSanitizer.Sanitize(scope ?? "null"), LogSanitizer.Sanitize(message?.TaskId ?? "none"));
+
+            return message?.TaskId;
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "GetLastTaskId");
+    }
+
+    public async Task<(int totalMessages, int activeUsers)> GetMessagingStatsAsync(
+        string tenantId, 
+        DateTime startDate, 
+        DateTime endDate, 
+        string? participantId = null)
+    {
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            _logger.LogDebug(
+                "Getting messaging stats for tenantId {TenantId}, dateRange {StartDate} to {EndDate}, participantId {ParticipantId}",
+                tenantId, startDate, endDate, participantId ?? "null");
+
+            // Build filter for messages in date range, only counting Chat type messages
+            var filterBuilder = Builders<ConversationMessage>.Filter;
+            var filter = filterBuilder.And(
+                filterBuilder.Eq(m => m.TenantId, tenantId),
+                filterBuilder.Eq(m => m.MessageType, MessageType.Chat),
+                filterBuilder.Gte(m => m.CreatedAt, startDate),
+                filterBuilder.Lte(m => m.CreatedAt, endDate)
+            );
+
+            // Add participant filter if specified
+            if (!string.IsNullOrEmpty(participantId))
+            {
+                filter = filterBuilder.And(filter, filterBuilder.Eq(m => m.ParticipantId, participantId));
+            }
+
+            // Count total messages
+            var totalMessages = await _messagesCollection.CountDocumentsAsync(filter);
+
+            // Count distinct active users (participants who sent messages)
+            var distinctParticipants = await _messagesCollection
+                .DistinctAsync<string>("participant_id", filter);
+            
+            var activeUsersList = await distinctParticipants.ToListAsync();
+            var activeUsers = activeUsersList.Count;
+
+            _logger.LogDebug(
+                "Messaging stats retrieved - TotalMessages: {TotalMessages}, ActiveUsers: {ActiveUsers}",
+                totalMessages, activeUsers);
+
+            return ((int)totalMessages, activeUsers);
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "GetMessagingStats");
+    }
+
+    #endregion
+
+    #region Private Helper Methods
+
+    /// <summary>
+    /// Standard field projection for reading conversation messages. Mirrors the inline projections
+    /// used by the other read methods so callers receive a consistent set of populated fields.
+    /// </summary>
+    private static ProjectionDefinition<ConversationMessage> BuildMessageProjection()
+    {
+        return Builders<ConversationMessage>.Projection
+            .Include(x => x.Id)
+            .Include(x => x.ThreadId)
+            .Include(x => x.TenantId)
+            .Include(x => x.ParticipantId)
+            .Include(x => x.WorkflowId)
+            .Include(x => x.WorkflowType)
+            .Include(x => x.CreatedAt)
+            .Include(x => x.UpdatedAt)
+            .Include(x => x.CreatedBy)
+            .Include(x => x.Direction)
+            .Include(x => x.MessageType)
+            .Include(x => x.Text)
+            .Include(x => x.Data)
+            .Include(x => x.Status)
+            .Include(x => x.Hint)
+            .Include(x => x.TaskId)
+            .Include(x => x.Scope)
+            .Include(x => x.RequestId)
+            .Include(x => x.Origin);
+    }
+
+    private async Task<ConversationThread?> GetByCompositeKeyAsync(string tenantId, string workflowId, string participantId)
+    {
+        var filter = Builders<ConversationThread>.Filter.And(
+            Builders<ConversationThread>.Filter.Eq(x => x.TenantId, tenantId),
+            Builders<ConversationThread>.Filter.Eq(x => x.WorkflowId, workflowId),
+            Builders<ConversationThread>.Filter.Eq(x => x.ParticipantId, participantId)
+        );
+
+        return await _threadsCollection.Find(filter).FirstOrDefaultAsync();
+    }
+
+    private static string BuildThreadIdCacheKey(string tenantId, string workflowId, string participantId)
+    {
+        return $"{ThreadIdCacheKeyPrefix}{tenantId}:{workflowId}:{participantId}";
+    }
+
+    private void CacheThreadId(string cacheKey, string threadId)
+    {
+        _memoryCache.Set(
+            cacheKey,
+            threadId,
+            new MemoryCacheEntryOptions()
+                .SetAbsoluteExpiration(ThreadIdCacheDuration)
+                .SetSize(1));
+    }
+
+    private void InvalidateThreadIdCache(string tenantId, string workflowId, string participantId)
+    {
+        _memoryCache.Remove(BuildThreadIdCacheKey(tenantId, workflowId, participantId));
+    }
+
+    private void DecryptMessageText(ConversationMessage message)
+    {
+        if (!string.IsNullOrEmpty(message.Text))
+        {
+            try
+            {
+                // Try to decrypt
+                var messageSpecificSecret = $"{_uniqueSecret}";
+                var decryptedText = _encryptionService.Decrypt(message.Text, messageSpecificSecret);
+                message.Text = decryptedText;
+                _logger.LogTrace("Successfully decrypted message {MessageId}", LogSanitizer.Sanitize(message.Id));
+            }
+            catch (FormatException)
+            {
+                // Not a valid Base64 string - this is plain text
+                _logger.LogDebug("Message {MessageId} is not encrypted (invalid Base64), treating as plain text", LogSanitizer.Sanitize(message.Id));
+                // Leave message.Text as-is
+            }   
+            catch (System.Security.Cryptography.AuthenticationTagMismatchException)
+            {
+                // This might be Base64 data that wasn't encrypted by our system
+                _logger.LogWarning("Message {MessageId} appears to be Base64 but decryption failed (authentication tag mismatch). This might be legacy data or corrupted encryption.", LogSanitizer.Sanitize(message.Id));
+                // Leave message.Text as-is
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unexpected error decrypting message {MessageId}. Text will remain as-is.", LogSanitizer.Sanitize(message.Id));
+                // Leave message.Text as-is
+            }
+        }
+    }
+
+    private BsonDocument? ConvertToBsonDocument(object? obj)
+    {
+        if (obj == null) return null;
+        
+        // If it's already a BsonDocument, just return it
+        if (obj is BsonDocument bsonDoc)
+        {
+            return bsonDoc;
+        }
+        
+        // If the object is already a string, ensure it's a valid JSON object
+        if (obj is string stringValue)
+        {
+            // If it looks like a JSON object, parse it directly
+            if ((stringValue.StartsWith("{") && stringValue.EndsWith("}")) ||
+                (stringValue.StartsWith("[") && stringValue.EndsWith("]")))
+            {
+                try 
+                {
+                    return BsonDocument.Parse(stringValue);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to parse string as JSON. Storing as simple string value.");
+                    // If parsing fails, wrap it in an object
+                    return new BsonDocument("value", stringValue);
+                }
+            }
+            
+            // If it's just a string, wrap it in a document
+            return new BsonDocument("value", stringValue);
+        }
+        
+        try 
+        {
+            // If it's a JsonElement, handle it specially
+            if (obj is JsonElement jsonElement)
+            {
+                return ConvertJsonElementToBson(jsonElement);
+            }
+            
+            // Convert the object to JSON, then to BsonDocument
+            var json = JsonSerializer.Serialize(obj);
+            return BsonDocument.Parse(json);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to convert object to BsonDocument. Storing as string representation.");
+            // If parsing fails, create a simpler BsonDocument with the string representation
+            return new BsonDocument("value", obj.ToString() ?? "");
+        }
+    }
+
+    private BsonDocument ConvertJsonElementToBson(JsonElement element)
+    {
+        if (element.ValueKind != JsonValueKind.Object)
+        {
+            return new BsonDocument("value", element.GetRawText());
+        }
+        
+        var document = new BsonDocument();
+        foreach (var property in element.EnumerateObject())
+        {
+            document[property.Name] = ConvertJsonElementToBsonValue(property.Value);
+        }
+        return document;
+    }
+
+    private BsonValue ConvertJsonElementToBsonValue(JsonElement element)
+    {
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.Object:
+                return ConvertJsonElementToBson(element);
+            case JsonValueKind.Array:
+                var array = new BsonArray();
+                foreach (var item in element.EnumerateArray())
+                {
+                    array.Add(ConvertJsonElementToBsonValue(item));
+                }
+                return array;
+            case JsonValueKind.String:
+                return new BsonString(element.GetString() ?? string.Empty);
+            case JsonValueKind.Number:
+                if (element.TryGetInt32(out int intValue))
+                    return new BsonInt32(intValue);
+                if (element.TryGetInt64(out long longValue))
+                    return new BsonInt64(longValue);
+                if (element.TryGetDecimal(out decimal decimalValue))
+                    return new BsonDecimal128(decimalValue);
+                return new BsonDouble(element.GetDouble());
+            case JsonValueKind.True:
+                return BsonBoolean.True;
+            case JsonValueKind.False:
+                return BsonBoolean.False;
+            case JsonValueKind.Null:
+                return BsonNull.Value;
+            default:
+                return BsonNull.Value;
+        }
+    }
+
+    private void ConvertBsonDataToObject(ConversationMessage message)
+    {
+        if (message.Data is BsonDocument bsonDoc)
+        {
+            // If it's a simple wrapper with a "value" field, extract the value
+            if (bsonDoc.Contains("value") && bsonDoc.ElementCount == 1)
+            {
+                var valueElement = bsonDoc["value"];
+                if (valueElement.IsString)
+                {
+                    // Try to deserialize if it looks like JSON
+                    string strValue = valueElement.AsString;
+                    if ((strValue.StartsWith("{") && strValue.EndsWith("}")) ||
+                        (strValue.StartsWith("[") && strValue.EndsWith("]")))
+                    {
+                        try
+                        {
+                            message.Data = JsonSerializer.Deserialize<object>(strValue);
+                            return;
+                        }
+                        catch
+                        {
+                            // If parsing fails, just use the string value
+                            message.Data = strValue;
+                            return;
+                        }
+                    }
+                    
+                    // It's just a string
+                    message.Data = strValue;
+                    return;
+                }
+            }
+            
+            // Convert BsonDocument to native .NET types properly
+            message.Data = ConvertBsonToNativeObject(bsonDoc);
+        }
+    }
+
+    private object? ConvertBsonToNativeObject(BsonValue bsonValue)
+    {
+        switch (bsonValue.BsonType)
+        {
+            case BsonType.Document:
+                var doc = bsonValue.AsBsonDocument;
+                var dict = new Dictionary<string, object?>();
+                foreach (var element in doc)
+                {
+                    dict[element.Name] = ConvertBsonToNativeObject(element.Value);
+                }
+                return dict;
+                
+            case BsonType.Array:
+                var array = bsonValue.AsBsonArray;
+                return array.Select(ConvertBsonToNativeObject).ToList();
+                
+            case BsonType.String:
+                return bsonValue.AsString;
+                
+            case BsonType.Boolean:
+                return bsonValue.AsBoolean;
+                
+            case BsonType.Int32:
+                return bsonValue.AsInt32;
+                
+            case BsonType.Int64:
+                return bsonValue.AsInt64;
+                
+            case BsonType.Double:
+                return bsonValue.AsDouble;
+                
+            case BsonType.Decimal128:
+                return bsonValue.AsDecimal;
+                
+            case BsonType.DateTime:
+                return bsonValue.ToUniversalTime();
+                
+            case BsonType.Null:
+            case BsonType.Undefined:
+                return null;
+                
+            default:
+                // For any other types, convert to string as fallback
+                return bsonValue.ToString();
+        }
+    }
+
+    #endregion
+}

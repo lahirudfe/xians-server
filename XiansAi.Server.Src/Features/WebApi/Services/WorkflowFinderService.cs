@@ -1,0 +1,961 @@
+using System.Text.RegularExpressions;
+using Microsoft.Extensions.Caching.Memory;
+using Shared.Auth;
+using Shared.Utils;
+using Temporalio.Client;
+using Temporalio.Converters;
+using System.Text.Json;
+using Temporalio.Api.WorkflowService.V1;
+using Temporalio.Api.TaskQueue.V1;
+using Shared.Utils.Temporal;
+using Shared.Data;
+using Features.WebApi.Repositories;
+using Shared.Repositories;
+using Shared.Utils.Services;
+using Features.WebApi.Models;
+using Temporalio.Common;
+using Temporalio.Api.History.V1;
+using Shared.Services;
+
+namespace Features.WebApi.Services;
+
+public interface IWorkflowFinderService
+{
+    Task<ServiceResult<WorkflowResponse>> GetWorkflow(string workflowId, string? runId = null);
+    Task<ServiceResult<List<WorkflowsWithAgent>>> GetWorkflows(string? status);
+    Task<ServiceResult<PaginatedWorkflowsResponse>> GetWorkflows(string? status, string? agent, string? workflowType, string? user, string? idPostfix, int? pageSize, string? pageToken);
+    Task<ServiceResult<List<WorkflowResponse>>> GetRunningWorkflowsByAgentAndType(string? agentName, string? typeName);
+    Task<ServiceResult<List<string>>> GetWorkflowTypes(string agent);
+    /// <summary>
+    /// Gets distinct idPostfix values from workflow runs in Temporal (for the current tenant and agents the user can read).
+    /// </summary>
+    Task<ServiceResult<List<string>>> GetDistinctIdPostfixValuesAsync();
+}
+
+/// <summary>
+/// Endpoint for retrieving and managing workflow information from Temporal.
+/// </summary>
+public class WorkflowFinderService : IWorkflowFinderService
+{
+    private readonly ITemporalGatewayFactory _temporalGatewayFactory;
+    private readonly ILogger<WorkflowFinderService> _logger;
+    private readonly ITenantContext _tenantContext;
+    private readonly IAgentRepository _agentRepository;
+    private readonly IPermissionsService _permissionsService;
+    private readonly IMemoryCache _cache;
+    private readonly ILogRepository _logRepository;
+    private static readonly TimeSpan DistinctIdPostfixCacheDuration = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="WorkflowFinderService"/> class.
+    /// </summary>
+    /// <param name="temporalGatewayFactory">The Temporal gateway factory for workflow operations.</param>
+    /// <param name="logger">Logger for recording operational events.</param>
+    /// <param name="tenantContext">Context containing tenant-specific information.</param>
+    /// <param name="agentRepository">The agent repository for accessing agent information.</param>
+    /// <param name="permissionsService">The permissions service for checking permissions.</param>
+    /// <param name="cache">In-memory cache for distinct idPostfix list (reduces Temporal queries when loading activations dropdown).</param>
+    /// <param name="logRepository">The log repository for retrieving workflow logs.</param>
+    /// <exception cref="ArgumentNullException">Thrown when any required dependency is null.</exception>
+    public WorkflowFinderService(
+        ITemporalGatewayFactory temporalGatewayFactory,
+        ILogger<WorkflowFinderService> logger,
+        ITenantContext tenantContext,
+        IAgentRepository agentRepository,
+        IPermissionsService permissionsService,
+        IMemoryCache cache,
+        ILogRepository logRepository)
+    {
+        _temporalGatewayFactory = temporalGatewayFactory ?? throw new ArgumentNullException(nameof(temporalGatewayFactory));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _tenantContext = tenantContext ?? throw new ArgumentNullException(nameof(tenantContext));
+        _agentRepository = agentRepository ?? throw new ArgumentNullException(nameof(agentRepository));
+        _permissionsService = permissionsService ?? throw new ArgumentNullException(nameof(permissionsService));
+        _cache = cache ?? throw new ArgumentNullException(nameof(cache));
+        _logRepository = logRepository ?? throw new ArgumentNullException(nameof(logRepository));
+    }
+
+    /// <summary>
+    /// Retrieves a specific workflow by its ID.
+    /// </summary>
+    /// <param name="workflowId">The unique identifier of the workflow.</param>
+    /// <param name="workflowRunId">Optional run identifier for the workflow.</param>
+    /// <returns>A result containing the workflow details if found, or an error response.</returns>
+    public async Task<ServiceResult<WorkflowResponse>> GetWorkflow(string workflowId, string? workflowRunId)
+    {
+        var loggedInUser = _tenantContext.LoggedInUser;
+        if (string.IsNullOrEmpty(loggedInUser))
+        {
+            _logger.LogWarning("GetWorkflow called with no authenticated user.");
+            return ServiceResult<WorkflowResponse>.Unauthorized("User is not authenticated.");
+        }
+
+        if (string.IsNullOrWhiteSpace(workflowId))
+        {
+            _logger.LogWarning("Attempt to retrieve workflow with empty workflowId");
+            return ServiceResult<WorkflowResponse>.BadRequest("WorkflowId cannot be empty");
+        }
+
+        try
+        {
+            _logger.LogInformation("Retrieving workflow with ID: {WorkflowId} and workflowRunId: {WorkflowRunId}", LogSanitizer.Sanitize(workflowId), LogSanitizer.Sanitize(workflowRunId));
+            var client = await _temporalGatewayFactory.GetClientAsync(WorkflowIdentifier.GetAgentName(WorkflowIdentifier.GetWorkflowType(workflowId)));
+            var workflowHandle = client.GetWorkflowHandle(workflowId, workflowRunId);
+
+            var workflowDescription = await workflowHandle.DescribeAsync();
+
+            var agent = ExtractMemoValue(workflowDescription.Memo, Constants.AgentKey);
+            if (agent == null)
+            {
+                return ServiceResult<WorkflowResponse>.NotFound("Agent metadata not found in workflow");
+            }
+            var hasReadPermission = await _permissionsService.HasReadPermission(agent);
+            if (!hasReadPermission.Data)
+            {
+                return ServiceResult<WorkflowResponse>.Forbidden("You do not have read permission to this agent");
+            }
+
+            //log the workflow description object
+            _logger.LogDebug("Workflow description: {Description}", LogSanitizer.Sanitize(JsonSerializer.Serialize(workflowDescription)));
+            string recentWorkerCount = await GetRecentWorkerCount(client, workflowDescription.TaskQueue!);
+
+            var history = await workflowHandle.FetchHistoryAsync();
+            var workflow = MapWorkflowToResponse(workflowDescription, history, recentWorkerCount, workflowDescription.TaskQueue!);
+            if (workflow == null)
+            {
+                return ServiceResult<WorkflowResponse>.NotFound("Agent metadata not found in workflow");
+            }
+
+            _logger.LogInformation("Successfully retrieved workflow {WorkflowId} of type {WorkflowType}",
+                LogSanitizer.Sanitize(workflow.WorkflowId), LogSanitizer.Sanitize(workflow.WorkflowType));
+            return ServiceResult<WorkflowResponse>.Success(workflow);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to retrieve workflow {WorkflowId}. Error: {ErrorMessage}",
+                LogSanitizer.Sanitize(workflowId), LogSanitizer.Sanitize(ex.Message));
+            return ServiceResult<WorkflowResponse>.BadRequest("Failed to retrieve workflow");
+        }
+    }
+
+    /// <summary>
+    /// Retrieves a list of workflows based on specified filters with pagination support.
+    /// </summary>
+    /// <param name="status">Optional status filter for workflows.</param>
+    /// <param name="agent">Optional agent filter for workflows.</param>
+    /// <param name="workflowType">Optional workflow type filter for workflows.</param>
+    /// <param name="user">Optional user filter for workflows.</param>
+    /// <param name="idPostfix">Optional activation name filter (Temporal search attribute idPostfix).</param>
+    /// <param name="pageSize">Number of items per page (default: 20, max: 100).</param>
+    /// <param name="pageToken">Token for pagination continuation.</param>
+    /// <returns>A result containing the paginated list of workflows.</returns>
+    public async Task<ServiceResult<PaginatedWorkflowsResponse>> GetWorkflows(string? status, string? agent, string? workflowType, string? user, string? idPostfix, int? pageSize, string? pageToken)
+    {
+        _logger.LogInformation("Retrieving paginated workflows with filters - Status: {Status}, Agent: {Agent}, WorkflowType: {WorkflowType}, User: {User}, IdPostfix: {IdPostfix}, PageSize: {PageSize}, PageToken: {PageToken}",
+            status ?? "null", agent ?? "null", workflowType ?? "null", user ?? "null", idPostfix ?? "null", pageSize ?? 20, pageToken ?? "null");
+
+        // Validate page size
+        var actualPageSize = pageSize ?? 20;
+        if (actualPageSize <= 0 || actualPageSize > 100)
+        {
+            actualPageSize = 20;
+        }
+
+        try
+        {
+            var loggedInUser = _tenantContext.LoggedInUser;
+            if (string.IsNullOrEmpty(loggedInUser))
+            {
+                _logger.LogWarning("GetWorkflows called with no authenticated user (LoggedInUser is empty).");
+                return ServiceResult<PaginatedWorkflowsResponse>.Unauthorized("User is not authenticated.");
+            }
+
+            // agent is an optional filter here - the listing can span every agent in the tenant.
+            var workflows = new List<WorkflowResponse>();
+
+            var tenantId = _tenantContext.TenantId ?? string.Empty;
+            if (!string.IsNullOrEmpty(tenantId))
+            {
+                ValidateTqlValue(tenantId);
+            }
+
+            // Build query for agent filtering
+            var queryParts = new List<string>
+            {
+                $"{Constants.TenantIdKey} = '{tenantId}'"
+            };
+
+            // Add agent filter if specified
+            if (!string.IsNullOrEmpty(agent))
+            {
+                ValidateTqlValue(agent);
+                // Check if user has permission to read this agent
+                var hasReadPermission = await _permissionsService.HasReadPermission(agent);
+                if (!hasReadPermission.Data)
+                {
+                    return ServiceResult<PaginatedWorkflowsResponse>.Forbidden("You do not have read permission to this agent");
+                }
+                queryParts.Add($"{Constants.AgentKey} = '{agent}'");
+            }
+            else
+            {
+                // If no specific agent, get all agents user has permission to
+                var agents = await _agentRepository.GetAgentsWithPermissionAsync(loggedInUser, _tenantContext.TenantId);
+                if (agents == null || agents.Count == 0)
+                {
+                    return ServiceResult<PaginatedWorkflowsResponse>.Success(new PaginatedWorkflowsResponse
+                    {
+                        Workflows = new List<WorkflowResponse>(),
+                        NextPageToken = null,
+                        PageSize = actualPageSize,
+                        HasNextPage = false,
+                        TotalCount = 0
+                    });
+                }
+                var agentNames = agents.Select(a => a.Name).ToArray();
+                foreach (var a in agentNames) ValidateTqlValue(a);
+                queryParts.Add($"{Constants.AgentKey} in ({string.Join(",", agentNames.Select(a => "'" + a + "'"))})");
+            }
+
+            // Add status filter if specified
+            if (!string.IsNullOrEmpty(status))
+            {
+                status = status.ToLower();
+                string? normalizedStatus = status switch
+                {
+                    "running" => "Running",
+                    "completed" => "Completed",
+                    "failed" => "Failed",
+                    "canceled" => "Canceled",
+                    "terminated" => "Terminated",
+                    "continuedasnew" => "ContinuedAsNew",
+                    "timedout" => "TimedOut",
+                    _ => null
+                };
+                if (normalizedStatus == null)
+                {
+                    return ServiceResult<PaginatedWorkflowsResponse>.BadRequest("Unknown status value provided.");
+                }
+                queryParts.Add($"ExecutionStatus = '{normalizedStatus}'");
+            }
+
+            // Add workflow type filter if specified
+            if (!string.IsNullOrEmpty(workflowType))
+            {
+                ValidateTqlValue(workflowType);
+                queryParts.Add($"WorkflowType = '{workflowType}'");
+            }
+
+            // Add user filter if specified
+            if (!string.IsNullOrEmpty(user))
+            {
+                ValidateTqlValue(user);
+                queryParts.Add($"{Constants.UserIdKey} = '{user}'");
+            }
+
+            // Add idPostfix (activation name) filter if specified - Temporal search attribute
+            if (!string.IsNullOrEmpty(idPostfix))
+            {
+                ValidateTqlValue(idPostfix);
+                queryParts.Add($"{Constants.IdPostfixKey} = '{idPostfix}'");
+            }
+
+            var listQuery = string.Join(" and ", queryParts);
+            _logger.LogDebug("Executing paginated workflow query: {Query}", LogSanitizer.Sanitize(listQuery));
+
+            // Pagination uses a page-number token; for page N we fetch and discard (N-1)*pageSize records.
+            // This becomes expensive for deep pages. Temporal exposes ListWorkflowsPaginatedAsync with
+            // byte[] continuation tokens for efficient cursor-based pagination—consider migrating if scale requires it.
+            int skipCount = 0;
+            if (!string.IsNullOrEmpty(pageToken) && int.TryParse(pageToken, out var pageNumber))
+            {
+                skipCount = (pageNumber - 1) * actualPageSize;
+            }
+
+            // To avoid fetching too many items for later pages, we'll use a reasonable limit
+            // but ensure we get enough for the requested page
+            var minRequiredItems = skipCount + actualPageSize + 1; // +1 to check for next page
+            var fetchLimit = Math.Max(minRequiredItems, 100); // Fetch at least 100 or the required amount
+            
+            var listOptions = new WorkflowListOptions
+            {
+                Limit = fetchLimit
+            };
+
+            var allWorkflows = new List<WorkflowResponse>();
+            var itemsProcessed = 0;
+            
+            await foreach (var client in _temporalGatewayFactory.GetClientsForAgentAsync(agent))
+            {
+                await foreach (var workflow in client.ListWorkflowsAsync(listQuery, listOptions))
+                {
+                    var mappedWorkflow = MapWorkflowToResponse(workflow);
+                    if (mappedWorkflow != null)
+                    {
+                        allWorkflows.Add(mappedWorkflow);
+                    }
+                    itemsProcessed++;
+                    
+                    // If we have enough items for this page and to determine next page, we can break early
+                    if (itemsProcessed >= minRequiredItems)
+                    {
+                        break;
+                    }
+                }
+
+                if (itemsProcessed >= minRequiredItems)
+                {
+                    break;
+                }
+            }
+
+            // Apply pagination to the collected results
+            var totalResults = allWorkflows.Count;
+            var startIndex = skipCount;
+            var endIndex = Math.Min(startIndex + actualPageSize, totalResults);
+            
+            _logger.LogDebug("Pagination details: TotalResults={TotalResults}, StartIndex={StartIndex}, EndIndex={EndIndex}, PageSize={PageSize}, PageToken={PageToken}, SkipCount={SkipCount}, FetchLimit={FetchLimit}, ItemsProcessed={ItemsProcessed}", 
+                totalResults, startIndex, endIndex, actualPageSize, pageToken ?? "null", skipCount, fetchLimit, itemsProcessed);
+            
+            // Get the workflows for this page
+            workflows = allWorkflows.Skip(startIndex).Take(actualPageSize).ToList();
+            
+            // Determine if there's a next page
+            string? nextPageToken = null;
+            var hasNextPage = startIndex + actualPageSize < totalResults
+                || (itemsProcessed >= fetchLimit && totalResults >= minRequiredItems - 1);
+            if (hasNextPage)
+            {
+                nextPageToken = GetNextPageNumber(pageToken).ToString();
+            }
+            
+            _logger.LogInformation("Pagination result: Retrieved {ActualCount} workflows out of {TotalResults} for page {CurrentPage}, HasNextPage={HasNextPage}", 
+                workflows.Count, totalResults, pageToken ?? "1", nextPageToken != null);
+
+            // Retrieve last logs for workflows in this page
+            var runIds = workflows.Select(w => w.RunId).Where(r => !string.IsNullOrEmpty(r)).Cast<string>().ToList();
+            var logs = await _logRepository.GetLastLogsByRunIdsAsync(runIds);
+            foreach (var workflow in workflows)
+            {
+                var lastLog = logs.FirstOrDefault(x => x.WorkflowRunId == workflow.RunId);
+                if (lastLog != null)
+                {
+                    workflow.LastLog = lastLog;
+                }
+            }
+
+            var response = new PaginatedWorkflowsResponse
+            {
+                Workflows = workflows,
+                NextPageToken = nextPageToken,
+                PageSize = actualPageSize,
+                HasNextPage = nextPageToken != null,
+                TotalCount = null // Temporal doesn't provide total count efficiently
+            };
+
+            _logger.LogInformation("Retrieved {Count} workflows for page", workflows.Count);
+            return ServiceResult<PaginatedWorkflowsResponse>.Success(response);
+        }
+        catch (ArgumentException ex)
+        {
+            _logger.LogWarning(ex, "Invalid filter value in GetWorkflows");
+            return ServiceResult<PaginatedWorkflowsResponse>.BadRequest("Invalid filter value.");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to retrieve paginated workflows. Error: {ErrorMessage}", LogSanitizer.Sanitize(ex.Message));
+            return ServiceResult<PaginatedWorkflowsResponse>.InternalServerError("Failed to retrieve workflows");
+        }
+    }
+
+    /// <summary>
+    /// Retrieves a list of workflows based on specified filters (legacy method - maintains backward compatibility).
+    /// </summary>
+    /// <param name="status">Optional status filter for workflows.</param>
+    /// <returns>A result containing the list of filtered workflows.</returns>
+    public async Task<ServiceResult<List<WorkflowsWithAgent>>> GetWorkflows(string? status)
+    {
+        _logger.LogInformation("Retrieving workflows with filters - Status: {Status}", LogSanitizer.Sanitize(status ?? "null"));
+
+        var loggedInUser = _tenantContext.LoggedInUser;
+        if (string.IsNullOrEmpty(loggedInUser))
+        {
+            _logger.LogWarning("GetWorkflows (legacy) called with no authenticated user (LoggedInUser is empty).");
+            return ServiceResult<List<WorkflowsWithAgent>>.Unauthorized("User is not authenticated.");
+        }
+
+        var agents = await _agentRepository.GetAgentsWithPermissionAsync(loggedInUser, _tenantContext.TenantId);
+
+        if (agents == null || agents.Count == 0)
+        {
+            return ServiceResult<List<WorkflowsWithAgent>>.Success(new List<WorkflowsWithAgent>());
+        }
+        var agentNames = agents.Select(a => a.Name).ToArray();
+        var allWorkflowResponses = new List<WorkflowResponse>();
+
+        try
+        {
+
+            var listQuery = BuildQuery(agentNames, status);
+
+            _logger.LogDebug("Executing workflow query: {Query}", LogSanitizer.Sanitize(string.IsNullOrEmpty(listQuery) ? "No date filters" : listQuery));
+
+            await foreach (var client in _temporalGatewayFactory.GetClientsAsync(_tenantContext.TenantId))
+            {
+                await foreach (var workflow in client.ListWorkflowsAsync(listQuery))
+                {
+                    var mappedWorkflow = MapWorkflowToResponse(workflow);
+                    if (mappedWorkflow != null)
+                    {
+                        allWorkflowResponses.Add(mappedWorkflow);
+                    }
+                }
+            }
+            _logger.LogInformation("Retrieved {Count} workflows matching the specified criteria", allWorkflowResponses.Count);
+
+            // retrieve last logs for each workflow run
+            var runIds = allWorkflowResponses.Select(w => w.RunId).Where(r => !string.IsNullOrEmpty(r)).Cast<string>().ToList();
+            var logs = await _logRepository.GetLastLogsByRunIdsAsync(runIds);
+            foreach (var workflow in allWorkflowResponses)
+            {
+                var lastLog = logs.FirstOrDefault(x => x.WorkflowRunId == workflow.RunId);
+                if (lastLog != null)
+                {
+                    workflow.LastLog = lastLog;
+                }
+            }
+
+            // Group workflows by agent
+            var workflowsGroupedByAgent = allWorkflowResponses
+                .GroupBy(w => w.Agent)
+                .Select(group => 
+                {
+                    var dbAgent = agents.FirstOrDefault(a => a.Name == group.Key);
+                    if (dbAgent == null)
+                    {
+                        // Create a minimal agent object with just the name when no database record exists
+                        dbAgent = new Agent
+                        {
+                            Id = "-deleted-" + Guid.NewGuid().ToString(),
+                            Name = group.Key,
+                            Tenant = _tenantContext.TenantId,
+                            CreatedBy = "unknown-agent", // Default value for unknown agents
+                            CreatedAt = DateTime.MinValue,
+                            OwnerAccess = new List<string>(),
+                            ReadAccess = new List<string>(),
+                            WriteAccess = new List<string>()
+                        };
+                    }
+                    
+                    return new WorkflowsWithAgent
+                    {
+                        Agent = dbAgent,
+                        Workflows = group.ToList()
+                    };
+                })
+                .ToList();
+
+            return ServiceResult<List<WorkflowsWithAgent>>.Success(workflowsGroupedByAgent);
+        }
+        catch (ArgumentException ex)
+        {
+            _logger.LogWarning(ex, "Invalid filter value in GetWorkflows (legacy)");
+            return ServiceResult<List<WorkflowsWithAgent>>.BadRequest("Invalid filter value.");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to retrieve workflows. Error: {ErrorMessage}", LogSanitizer.Sanitize(ex.Message));
+            return ServiceResult<List<WorkflowsWithAgent>>.InternalServerError("Failed to retrieve workflows");
+        }
+    }
+
+    /// <summary>
+    /// Retrieves all unique workflow types for a specific agent.
+    /// </summary>
+    /// <param name="agent">The agent name to filter workflows by.</param>
+    /// <returns>A result containing the list of unique workflow types.</returns>
+    public async Task<ServiceResult<List<string>>> GetWorkflowTypes(string agent)
+    {
+        var loggedInUser = _tenantContext.LoggedInUser;
+        if (string.IsNullOrEmpty(loggedInUser))
+        {
+            _logger.LogWarning("GetWorkflowTypes called with no authenticated user.");
+            return ServiceResult<List<string>>.Unauthorized("User is not authenticated.");
+        }
+
+        if (string.IsNullOrWhiteSpace(agent))
+        {
+            _logger.LogWarning("Attempt to retrieve workflow types with empty agent");
+            return ServiceResult<List<string>>.BadRequest("Agent cannot be empty");
+        }
+
+        _logger.LogInformation("Retrieving workflow types for agent: {Agent}", LogSanitizer.Sanitize(agent));
+
+        try
+        {
+            ValidateTqlValue(agent);
+
+            // Check if user has permission to read this agent
+            var hasReadPermission = await _permissionsService.HasReadPermission(agent);
+            if (!hasReadPermission.Data)
+            {
+                return ServiceResult<List<string>>.Forbidden("You do not have read permission to this agent");
+            }
+
+            var client = await _temporalGatewayFactory.GetClientAsync(agent);
+            var workflowTypes = new HashSet<string>();
+
+            var tenantId = _tenantContext.TenantId ?? string.Empty;
+            if (!string.IsNullOrEmpty(tenantId))
+            {
+                ValidateTqlValue(tenantId);
+            }
+
+            var queryParts = new List<string>
+            {
+                $"{Constants.TenantIdKey} = '{tenantId}'",
+                $"{Constants.AgentKey} = '{agent}'"
+            };
+
+            var listQuery = string.Join(" and ", queryParts);
+            _logger.LogDebug("Executing workflow types query: {Query}", LogSanitizer.Sanitize(listQuery));
+
+            await foreach (var workflow in client.ListWorkflowsAsync(listQuery))
+            {
+                if (!string.IsNullOrEmpty(workflow.WorkflowType))
+                {
+                    workflowTypes.Add(workflow.WorkflowType);
+                }
+            }
+
+            var sortedTypes = workflowTypes.OrderBy(t => t).ToList();
+            _logger.LogInformation("Retrieved {Count} unique workflow types for agent {Agent}", sortedTypes.Count, LogSanitizer.Sanitize(agent));
+            return ServiceResult<List<string>>.Success(sortedTypes);
+        }
+        catch (ArgumentException ex)
+        {
+            _logger.LogWarning(ex, "Invalid agent value in GetWorkflowTypes");
+            return ServiceResult<List<string>>.BadRequest("Invalid filter value.");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to retrieve workflow types for agent {Agent}. Error: {ErrorMessage}", LogSanitizer.Sanitize(agent), LogSanitizer.Sanitize(ex.Message));
+            return ServiceResult<List<string>>.InternalServerError("Failed to retrieve workflow types");
+        }
+    }
+
+    /// <summary>
+    /// Gets distinct idPostfix values from workflow runs in Temporal for the current tenant and agents the user can read.
+    /// Result is cached per tenant+user for 5 minutes to reduce Temporal queries when loading the activations dropdown.
+    /// </summary>
+    public async Task<ServiceResult<List<string>>> GetDistinctIdPostfixValuesAsync()
+    {
+        // Self-defense guard: ActivationsEndpoints requires auth and returns early when agents is empty,
+        // so it does not call this method unauthenticated. This check protects against future callers
+        // or middleware bypass.
+        var loggedInUser = _tenantContext.LoggedInUser;
+        if (string.IsNullOrEmpty(loggedInUser))
+        {
+            _logger.LogWarning("GetDistinctIdPostfixValuesAsync called with no authenticated user (LoggedInUser is empty).");
+            return ServiceResult<List<string>>.Unauthorized("User is not authenticated.");
+        }
+
+        var tenantId = _tenantContext.TenantId ?? string.Empty;
+        var cacheKey = $"activations:distinctidpostfix:{tenantId}:{loggedInUser}";
+
+        if (_cache.TryGetValue(cacheKey, out List<string>? cached))
+        {
+            return ServiceResult<List<string>>.Success(cached ?? new List<string>());
+        }
+
+        try
+        {
+            var agents = await _agentRepository.GetAgentsWithPermissionAsync(loggedInUser, _tenantContext.TenantId);
+            if (agents == null || agents.Count == 0)
+            {
+                return ServiceResult<List<string>>.Success(new List<string>());
+            }
+
+            var agentNames = agents.Select(a => a.Name).ToArray();
+            foreach (var a in agentNames) ValidateTqlValue(a);
+            if (!string.IsNullOrEmpty(tenantId))
+            {
+                ValidateTqlValue(tenantId);
+            }
+            var queryParts = new List<string>
+            {
+                $"{Constants.TenantIdKey} = '{tenantId}'",
+                $"{Constants.AgentKey} in ({string.Join(",", agentNames.Select(a => "'" + a + "'"))})"
+            };
+            var listQuery = string.Join(" and ", queryParts);
+
+            var postfixSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            const int maxWorkflowsToScan = 500;
+            var listOptions = new WorkflowListOptions { Limit = maxWorkflowsToScan };
+            var count = 0;
+
+            await foreach (var client in _temporalGatewayFactory.GetClientsAsync(tenantId))
+            {
+                await foreach (var workflow in client.ListWorkflowsAsync(listQuery, listOptions))
+                {
+                    var idPostfix = ExtractMemoValue(workflow.Memo, Constants.IdPostfixKey);
+                    if (!string.IsNullOrWhiteSpace(idPostfix))
+                    {
+                        postfixSet.Add(idPostfix.Trim());
+                    }
+                    count++;
+                    if (count >= maxWorkflowsToScan) break;
+                }
+            }
+
+            var result = postfixSet.OrderBy(s => s, StringComparer.OrdinalIgnoreCase).ToList();
+            _logger.LogDebug("Found {Count} distinct idPostfix values from Temporal (scanned up to {Max} workflows)", result.Count, maxWorkflowsToScan);
+
+            var cacheOptions = new MemoryCacheEntryOptions()
+                .SetAbsoluteExpiration(DistinctIdPostfixCacheDuration)
+                .SetSize(1);
+            _cache.Set(cacheKey, result, cacheOptions);
+
+            return ServiceResult<List<string>>.Success(result);
+        }
+        catch (ArgumentException ex)
+        {
+            _logger.LogWarning(ex, "Invalid agent value in GetDistinctIdPostfixValuesAsync");
+            return ServiceResult<List<string>>.BadRequest("Invalid filter value.");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get distinct idPostfix values from Temporal. Error: {ErrorMessage}", LogSanitizer.Sanitize(ex.Message));
+            return ServiceResult<List<string>>.InternalServerError("Failed to get distinct idPostfix values");
+        }
+    }
+
+    /// <summary>
+    /// Retrieves a list of workflows based on agent name and workflow type.
+    /// </summary>
+    /// <param name="agentName">Optional agent name filter for workflows.</param>
+    /// <param name="typeName">Optional workflow type filter for workflows.</param>
+    /// <returns>A result containing the list of filtered workflows.</returns>
+    public async Task<ServiceResult<List<WorkflowResponse>>> GetRunningWorkflowsByAgentAndType(string? agentName, string? typeName)
+    {
+        var loggedInUser = _tenantContext.LoggedInUser;
+        if (string.IsNullOrEmpty(loggedInUser))
+        {
+            _logger.LogWarning("GetRunningWorkflowsByAgentAndType called with no authenticated user (LoggedInUser is empty).");
+            return ServiceResult<List<WorkflowResponse>>.Unauthorized("User is not authenticated.");
+        }
+
+        _logger.LogInformation("Retrieving workflows with filters - AgentName: {AgentName}, TypeName: {TypeName}",
+            LogSanitizer.Sanitize(agentName ?? "null"), LogSanitizer.Sanitize(typeName ?? "null"));
+
+        try
+        {
+            var tenantId = _tenantContext.TenantId ?? string.Empty;
+            if (!string.IsNullOrEmpty(tenantId))
+            {
+                ValidateTqlValue(tenantId);
+            }
+
+            // agentName is an optional filter here - the listing can span every agent in the tenant.
+            var workflows = new List<WorkflowResponse>();
+            var queryParts = new List<string>
+            {
+                // Add tenantId filter
+                $"{Constants.TenantIdKey} = '{tenantId}'",
+                // status = running
+                "ExecutionStatus = 'Running'"
+            };
+
+            // Add agent filter if specified
+            if (!string.IsNullOrEmpty(agentName))
+            {
+                ValidateTqlValue(agentName);
+                var hasReadPermission = await _permissionsService.HasReadPermission(agentName);
+                if (!hasReadPermission.Data)
+                {
+                    return ServiceResult<List<WorkflowResponse>>.Forbidden(
+                        "You do not have read permission to this agent");
+                }
+                queryParts.Add($"{Constants.AgentKey} = '{agentName}'");
+            }
+
+            // Add workflow type filter if specified
+            if (!string.IsNullOrEmpty(typeName))
+            {
+                ValidateTqlValue(typeName);
+                queryParts.Add($"WorkflowType = '{typeName}'");
+            }
+
+            string listQuery = string.Join(" and ", queryParts);
+            _logger.LogDebug("Executing workflow query: {Query}", LogSanitizer.Sanitize(listQuery));
+
+            await foreach (var client in _temporalGatewayFactory.GetClientsForAgentAsync(agentName))
+            {
+                await foreach (var workflow in client.ListWorkflowsAsync(listQuery))
+                {
+                    var mappedWorkflow = MapWorkflowToResponse(workflow);
+                    if (mappedWorkflow != null)
+                    {
+                        workflows.Add(mappedWorkflow);
+                    }
+                }
+            }
+
+            _logger.LogInformation("Retrieved {Count} workflows matching agent and type criteria", workflows.Count);
+            return ServiceResult<List<WorkflowResponse>>.Success(workflows);
+        }
+        catch (ArgumentException ex)
+        {
+            _logger.LogWarning(ex, "Invalid filter value in GetRunningWorkflowsByAgentAndType");
+            return ServiceResult<List<WorkflowResponse>>.BadRequest("Invalid filter value.");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to retrieve workflows by agent and type. Error: {ErrorMessage}", LogSanitizer.Sanitize(ex.Message));
+            return ServiceResult<List<WorkflowResponse>>.InternalServerError("Failed to retrieve workflows by agent and type");
+        }
+    }
+
+    /// <summary>
+    /// Validates a value for safe use in Temporal Query Language (TQL) string interpolation.
+    /// Uses an allowlist to prevent keyword-based injection (e.g. "x AND TenantId = y").
+    /// Throws ArgumentException if the value fails validation.
+    /// </summary>
+    private static readonly Regex SafeTqlValuePattern =
+        new(@"^[a-zA-Z0-9\-_.@ ]{1,256}$", RegexOptions.Compiled);
+
+    private static void ValidateTqlValue(string value)
+    {
+        if (!SafeTqlValuePattern.IsMatch(value))
+            throw new ArgumentException("Filter value contains invalid characters.");
+    }
+
+    private static int GetNextPageNumber(string? pageToken)
+    {
+        return string.IsNullOrEmpty(pageToken) ? 2 : (int.TryParse(pageToken, out var currentPageNum) ? currentPageNum + 1 : 2);
+    }
+
+    /// <summary>
+    /// Builds a date range query string for filtering workflows.
+    /// </summary>
+    /// <param name="agents">The agent name to filter workflows by.</param>
+    /// <param name="status">Optional status filter for workflows.</param>
+    /// <returns>A query string for temporal workflow filtering.</returns>
+    private string BuildQuery(string[] agents, string? status)
+    {
+        var tenantId = _tenantContext.TenantId ?? string.Empty;
+        if (!string.IsNullOrEmpty(tenantId))
+        {
+            ValidateTqlValue(tenantId);
+        }
+
+        var queryParts = new List<string>
+        {
+            // Add tenantId filter
+            $"{Constants.TenantIdKey} = '{tenantId}'"
+        };    
+
+
+        if (agents.Length > 0) 
+        {
+            foreach (var a in agents) ValidateTqlValue(a);
+            queryParts.Add($"{Constants.AgentKey} in ({string.Join(",", agents.Select(a => "'" + a + "'"))})");
+        }
+        
+        // Add status filter if specified
+        if (!string.IsNullOrEmpty(status))
+        {
+            status = status.ToLower();
+            string? normalizedStatus = status switch
+            {
+                "running" => "Running",
+                "completed" => "Completed",
+                "failed" => "Failed",
+                "canceled" => "Canceled",
+                "terminated" => "Terminated",
+                "continuedasnew" => "ContinuedAsNew",
+                "timedout" => "TimedOut",
+                _ => null
+            };
+            if (normalizedStatus == null)
+            {
+                throw new ArgumentException("Unknown status value provided.");
+            }
+            queryParts.Add($"ExecutionStatus = '{normalizedStatus}'");
+        }
+
+        // Join all query parts with AND operator
+        var andParts = string.Join(" and ", queryParts);
+
+        _logger.LogDebug("Built query: {Query}", LogSanitizer.Sanitize(andParts));
+
+        return andParts;
+    }
+
+    /// <summary>
+    /// Identifies the current activity from the workflow history.
+    /// </summary>
+    /// <param name="workflowHistory">The workflow history to analyze.</param>
+    /// <returns>The current activity if found, otherwise null.</returns>
+    private ActivityTaskScheduledEventAttributes? IdentifyCurrentActivity(List<HistoryEvent> workflowHistory)
+    {
+        // Iterate in reverse to find the most recent unprocessed activity
+        for (int i = workflowHistory.Count - 1; i >= 0; i--)
+        {
+            var evt = workflowHistory[i];
+
+            if (evt.EventType.ToString() == "WorkflowExecutionCompleted" &&
+                evt.WorkflowExecutionCompletedEventAttributes != null)
+            {
+                // If the workflow is completed, we can stop looking for activities.
+                break;
+            }
+
+            if (evt.EventType.ToString() == "ActivityTaskScheduled" &&
+                evt.ActivityTaskScheduledEventAttributes != null)
+            {
+                // Check if this activity has been processed
+                bool hasBeenProcessed = workflowHistory
+                    .Skip(i + 1)
+                    .Any(e =>
+                        (e.EventType.ToString() == "ActivityTaskStarted" &&
+                         e.ActivityTaskStartedEventAttributes != null &&
+                         e.ActivityTaskStartedEventAttributes.ScheduledEventId == evt.EventId) ||
+                        (e.EventType.ToString() == "ActivityTaskCompleted" &&
+                         e.ActivityTaskCompletedEventAttributes != null &&
+                         e.ActivityTaskCompletedEventAttributes.ScheduledEventId == evt.EventId) ||
+                        (e.EventType.ToString() == "ActivityTaskFailed" &&
+                         e.ActivityTaskFailedEventAttributes != null &&
+                         e.ActivityTaskFailedEventAttributes.ScheduledEventId == evt.EventId)
+                    );
+
+                // If not processed, return this activity as the current one
+                if (!hasBeenProcessed)
+                {
+                    return evt.ActivityTaskScheduledEventAttributes;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Maps a Temporal workflow execution to a client-friendly response object.
+    /// </summary>
+    /// <param name="workflow">The workflow execution to map.</param>
+    /// <param name="history">Optional workflow history to analyze for current activity.</param>
+    /// <param name="numberOfWorkers">The number of workers associated with the workflow.</param>
+    /// <param name="taskQueue">The task queue associated with the workflow.</param>
+    /// <returns>A WorkflowResponse containing the mapped data, or null if agent metadata is missing.</returns>
+    private WorkflowResponse? MapWorkflowToResponse(WorkflowExecution workflow, WorkflowHistory? history = null, string numberOfWorkers = "N/A", string taskQueue = "N/A")
+    {
+        var tenantId = ExtractMemoValue(workflow.Memo, Constants.TenantIdKey);
+        var userId = ExtractMemoValue(workflow.Memo, Constants.UserIdKey);
+        var agent = ExtractMemoValue(workflow.Memo, Constants.AgentKey);
+
+        ActivityTaskScheduledEventAttributes? currentActivity = null;
+
+        if (history != null)
+        {
+            var eventsList = history.Events.ToList(); // Convert to a list for indexing
+
+            currentActivity = IdentifyCurrentActivity(eventsList);
+
+            if (currentActivity != null)
+            {
+                _logger.LogDebug("Current activity: Type = {ActivityType}, ActivityId = {ActivityId}",
+                    LogSanitizer.Sanitize(currentActivity.ActivityType?.Name), LogSanitizer.Sanitize(currentActivity.ActivityId));
+            }
+            else
+            {
+                _logger.LogDebug("No current (pending or running) activity found.");
+            }
+        }
+
+
+        if (agent == null)
+        {
+            return null; // Caller must handle — workflow lacks agent metadata
+        }
+
+        return new WorkflowResponse
+        {
+            Agent = agent,
+            ParentId = workflow.ParentId,
+            ParentRunId = workflow.ParentRunId,
+            WorkflowId = workflow.Id,
+            RunId = workflow.RunId,
+            WorkflowType = workflow.WorkflowType,
+            Status = workflow.Status.ToString(),
+            StartTime = workflow.StartTime,
+            ExecutionTime = workflow.ExecutionTime,
+            CloseTime = workflow.CloseTime,
+            TenantId = tenantId,
+            Owner = userId,
+            HistoryLength = workflow.HistoryLength,
+            CurrentActivity = currentActivity,
+            NumOfWorkers = numberOfWorkers,
+            TaskQueue = taskQueue
+        };
+    }
+
+    /// <summary>
+    /// Extracts a value from the workflow memo dictionary.
+    /// </summary>
+    /// <param name="memo">The memo dictionary containing workflow metadata.</param>
+    /// <param name="key">The key to extract.</param>
+    /// <returns>The extracted string value, or null if not found.</returns>
+    private string? ExtractMemoValue(IReadOnlyDictionary<string, IEncodedRawValue> memo, string key)
+    {
+        if (memo.TryGetValue(key, out var memoValue))
+        {
+            return memoValue?.Payload?.Data?.ToStringUtf8()?.Replace("\"", "");
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Retrieves the count of workers polling a task queue within the last minute.
+    /// </summary>
+    /// <param name="client">The Temporal client.</param>
+    /// <param name="taskQueueName">The name of the task queue.</param>
+    /// <returns>The count of recent workers as a string.</returns>
+    private async Task<string> GetRecentWorkerCount(ITemporalClient client, string taskQueueName)
+    {
+        try
+        {
+            var describeQueueRequest = new DescribeTaskQueueRequest
+            {
+                Namespace = client.Options.Namespace ?? string.Empty,
+                TaskQueue = new TaskQueue { Name = taskQueueName },
+                ReportPollers = true,      // ask for the list of current pollers
+                ReportStats = false,       // stats are optional here
+                ReportTaskReachability = false
+            };
+
+            var describeQueueResponse = await client.WorkflowService.DescribeTaskQueueAsync(describeQueueRequest);
+
+            var currentTime = DateTime.UtcNow;
+            var oneMinuteAgo = currentTime.AddMinutes(-1);
+            var recentWorkers = describeQueueResponse.Pollers
+                .Where(poller => DateTimeOffset.FromUnixTimeSeconds(poller.LastAccessTime.Seconds).UtcDateTime >= oneMinuteAgo)
+                .ToList();
+
+            string recentWorkerCount = recentWorkers.Count.ToString();
+            _logger.LogInformation(
+                "TaskQueue {TaskQueue} has {WorkerCount} worker(s) polling it within the last minute",
+                LogSanitizer.Sanitize(taskQueueName),
+                LogSanitizer.Sanitize(recentWorkerCount)
+            );
+
+            return recentWorkerCount;
+        }
+        catch (Exception)
+        {
+            _logger.LogWarning("Failed to retrieve recent worker count for TaskQueue {TaskQueue}", LogSanitizer.Sanitize(taskQueueName));
+            return "N/A"; // Return "N/A" if unable to retrieve the count
+        }
+
+    }
+}

@@ -1,0 +1,286 @@
+using System.Text.Json;
+using MongoDB.Bson;
+using MongoDB.Bson.Serialization.Attributes;
+using Shared.Data;
+using Shared.Data.Models;
+using Shared.Data.Models.Validation;
+using System.ComponentModel.DataAnnotations;
+
+[BsonIgnoreExtraElements]
+public class Agent : ModelValidatorBase<Agent>
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public required string Id { get; set; }
+
+    [BsonElement("name")]
+    [StringLength(100, MinimumLength = 1, ErrorMessage = "Agent name must be between 1 and 100 characters")]
+    [RegularExpression(@"^[a-zA-Z0-9\s._@|+\-:/\\,#=]+$", ErrorMessage = "Agent name contains invalid characters")]
+    public required string Name { get; set; }
+
+    [BsonElement("tenant")]
+    [StringLength(50, MinimumLength = 1, ErrorMessage = "Tenant must be between 1 and 50 characters")]
+    [RegularExpression(@"^[a-zA-Z0-9._@|+\-:/\\,#=]+$", ErrorMessage = "Tenant contains invalid characters")]
+    [Required(ErrorMessage = "Tenant is required")]
+    public required string? Tenant { get; set; }
+
+    [BsonElement("origin_tenant")]
+    [StringLength(50, MinimumLength = 1, ErrorMessage = "Origin tenant must be between 1 and 50 characters")]
+    [RegularExpression(@"^[a-zA-Z0-9._@|+\-:/\\,#=]+$", ErrorMessage = "Origin tenant contains invalid characters")]
+    public string? OriginTenant { get; set; }
+
+    [BsonElement("created_by")]
+    [StringLength(100, MinimumLength = 1, ErrorMessage = "Created by must be between 1 and 100 characters")]
+    [RegularExpression(@"^[a-zA-Z0-9\s._@|+\-:/\\,#=]+$", ErrorMessage = "Created by contains invalid characters")]
+    [Required(ErrorMessage = "Created by is required")]
+    public required string CreatedBy { get; set; }
+
+    [BsonElement("created_at")]
+    public DateTime CreatedAt { get; set; }
+
+    [BsonElement("owner_access")]
+    public List<string> OwnerAccess { get; set; } = new();
+
+    [BsonElement("read_access")]
+    public List<string> ReadAccess { get; set; } = new();
+
+    [BsonElement("write_access")]
+    public List<string> WriteAccess { get; set; } = new();
+
+    [BsonElement("system_scoped")]
+    public bool SystemScoped { get; set; } = false;
+
+    [BsonElement("onboarding_json")]
+    public string? OnboardingJson { get; set; }
+
+    [BsonElement("description")]
+    [StringLength(1000, ErrorMessage = "Description must not exceed 1000 characters")]
+    public string? Description { get; set; }
+
+    [BsonElement("summary")]
+    [StringLength(500, ErrorMessage = "Summary must not exceed 500 characters")]
+    public string? Summary { get; set; }
+
+    [BsonElement("version")]
+    [StringLength(50, ErrorMessage = "Version must not exceed 50 characters")]
+    [RegularExpression(@"^[a-zA-Z0-9._\-]+$", ErrorMessage = "Version contains invalid characters")]
+    public string? Version { get; set; }
+
+    [BsonElement("author")]
+    [StringLength(200, ErrorMessage = "Author must not exceed 200 characters")]
+    public string? Author { get; set; }
+
+    [BsonElement("category")]
+    [StringLength(100, ErrorMessage = "Category must not exceed 100 characters")]
+    public string? Category { get; set; }
+
+    [BsonElement("sample_prompts")]
+    public List<string> SamplePrompts { get; set; } = new();
+
+    [BsonElement("flows")]
+    public List<Flow>? Flows { get; set; }
+
+    public bool HasPermission(string userId, string[] userRoles, PermissionLevel requiredLevel)
+    {
+        if (requiredLevel == PermissionLevel.None)
+            return true;
+
+        if (requiredLevel == PermissionLevel.Owner)
+            return OwnerAccess.Contains(userId);
+
+        if (requiredLevel == PermissionLevel.Write)
+            return WriteAccess.Contains(userId) || OwnerAccess.Contains(userId);
+
+        if (requiredLevel == PermissionLevel.Read)
+            return ReadAccess.Contains(userId) || WriteAccess.Contains(userId) || OwnerAccess.Contains(userId);
+
+        return false;
+    }
+
+    public void GrantReadAccess(string userId)
+    {
+        if (!ReadAccess.Contains(userId))
+            ReadAccess.Add(userId);
+    }
+
+    public void RevokeReadAccess(string userId)
+    {
+        ReadAccess.Remove(userId);
+    }
+
+    public void GrantWriteAccess(string userId)
+    {
+        if (!WriteAccess.Contains(userId))
+            WriteAccess.Add(userId);
+    }
+
+    public void RevokeWriteAccess(string userId)
+    {
+        WriteAccess.Remove(userId);
+    }
+
+    public void GrantOwnerAccess(string userId)
+    {
+        if (!OwnerAccess.Contains(userId))
+            OwnerAccess.Add(userId);
+    }
+
+    public void RevokeOwnerAccess(string userId)
+    {
+        OwnerAccess.Remove(userId);
+    }
+
+    /// <summary>
+    /// Returns a shallow copy so callers cannot mutate the original.
+    /// </summary>
+    public Agent ShallowCopy()
+    {
+        return new Agent
+        {
+            Id = Id,
+            Name = Name,
+            Tenant = Tenant,
+            OriginTenant = OriginTenant,
+            CreatedBy = CreatedBy,
+            CreatedAt = CreatedAt,
+            OwnerAccess = OwnerAccess?.ToList() ?? new List<string>(),
+            ReadAccess = ReadAccess?.ToList() ?? new List<string>(),
+            WriteAccess = WriteAccess?.ToList() ?? new List<string>(),
+            SystemScoped = SystemScoped,
+            OnboardingJson = OnboardingJson,
+            Description = Description,
+            Summary = Summary,
+            Version = Version,
+            Author = Author,
+            Category = Category,
+            SamplePrompts = SamplePrompts?.ToList() ?? new List<string>(),
+            Flows = Flows?.Select(f => f.ShallowCopy()).ToList()
+        };
+    }
+
+    public override string ToString()
+    {
+        return JsonSerializer.Serialize(this);
+    }
+    public override Agent SanitizeAndReturn()
+    {
+        // Create a new agent with sanitized data
+        var sanitizedAgent = new Agent
+        {
+            Id = this.Id,
+            Name = ValidationHelpers.SanitizeString(this.Name),
+            Tenant = ValidationHelpers.SanitizeString(this.Tenant),
+            OriginTenant = ValidationHelpers.SanitizeString(this.OriginTenant),
+            CreatedBy = ValidationHelpers.SanitizeString(this.CreatedBy),
+            CreatedAt = this.CreatedAt,
+            OwnerAccess = ValidationHelpers.SanitizeStringList(this.OwnerAccess),
+            ReadAccess = ValidationHelpers.SanitizeStringList(this.ReadAccess),
+            WriteAccess = ValidationHelpers.SanitizeStringList(this.WriteAccess),
+            SystemScoped = this.SystemScoped,
+            OnboardingJson = ValidationHelpers.SanitizeString(this.OnboardingJson),
+            Description = ValidationHelpers.SanitizeString(this.Description),
+            Summary = ValidationHelpers.SanitizeString(this.Summary),
+            Version = ValidationHelpers.SanitizeString(this.Version),
+            Author = ValidationHelpers.SanitizeString(this.Author),
+            Category = ValidationHelpers.SanitizeString(this.Category),
+            SamplePrompts = ValidationHelpers.SanitizeStringList(this.SamplePrompts),
+            Flows = this.Flows
+        };
+
+        return sanitizedAgent;
+    }
+
+    public override Agent SanitizeAndValidate()
+    {
+        // First sanitize
+        var sanitizedAgent = this.SanitizeAndReturn();
+        sanitizedAgent.Validate();
+
+        return sanitizedAgent;
+    }
+
+    public override void Validate()
+    {
+        // Call base validation (Data Annotations)
+        base.Validate();
+
+        // Validate agent name format
+        // if (!ValidationHelpers.IsValidPattern(Name, va))
+        //     throw new ValidationException("Invalid agent name format");
+
+        // Validate dates
+        if (!ValidationHelpers.IsValidDate(CreatedAt))
+            throw new ValidationException("Agent creation date is invalid");
+
+        if (CreatedAt > DateTime.UtcNow)
+            throw new ValidationException("Agent creation date cannot be in the future");
+
+        // Validate access lists
+        if (OwnerAccess != null)
+        {
+            if (!ValidationHelpers.IsValidList(OwnerAccess, item => !string.IsNullOrEmpty(item)))
+                throw new ValidationException("Owner access list contains invalid items");
+        }
+
+        if (ReadAccess != null)
+        {
+            if (!ValidationHelpers.IsValidList(ReadAccess, item => !string.IsNullOrEmpty(item)))
+                throw new ValidationException("Read access list contains invalid items");
+        }
+
+        if (WriteAccess != null)
+        {
+            if (!ValidationHelpers.IsValidList(WriteAccess, item => !string.IsNullOrEmpty(item)))
+                throw new ValidationException("Write access list contains invalid items");
+        }
+
+        // Validate onboarding JSON if provided
+        if (!string.IsNullOrEmpty(OnboardingJson))
+        {
+            try
+            {
+                JsonSerializer.Deserialize<JsonElement>(OnboardingJson);
+            }
+            catch (JsonException)
+            {
+                throw new ValidationException("OnboardingJson contains invalid JSON format");
+            }
+        }
+    }
+
+
+
+    /// <summary>
+    /// Validates and sanitizes an agent name
+    /// </summary>
+    /// <param name="agentName">The raw agent name to validate and sanitize</param>
+    /// <returns>The sanitized agent name</returns>
+    /// <exception cref="ValidationException">Thrown when validation fails</exception>
+    public static string SanitizeAndValidateName(string agentName)
+    {
+        if (string.IsNullOrWhiteSpace(agentName))
+            throw new ValidationException("Agent name is required");
+
+        // Sanitize the agent name
+        var sanitizedName = SanitizeName(agentName);
+
+        // Validate the agent name format
+        if (!ValidationHelpers.IsValidPattern(sanitizedName, ValidationHelpers.Patterns.AgentNamePattern))
+            throw new ValidationException("Invalid agent name format");
+
+        return sanitizedName;
+    }
+    public static string SanitizeName(string agentName)
+    {
+        return ValidationHelpers.SanitizeString(agentName);
+    }
+} 
+
+
+public enum PermissionLevel
+{
+    None,
+    Read,
+    Write,
+    Owner
+}

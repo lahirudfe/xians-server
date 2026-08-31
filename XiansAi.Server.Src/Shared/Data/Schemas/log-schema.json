@@ -1,0 +1,83 @@
+{
+    "$jsonSchema": {
+        "bsonType": "object",
+        "required": ["tenant_id", "created_at", "level", "message", "workflow_id", "workflow_run_id"],
+        "properties": {
+            "tenant_id": {
+                "bsonType": "string",
+                "description": "Tenant ID associated with the log"
+            },
+            "created_at": {
+                "bsonType": "date",
+                "description": "Timestamp of log creation"
+            },
+            "level": {
+                "bsonType": "string",
+                "enum": ["Information", "Warning", "Error", "Debug", "Critical"],
+                "description": "Log level"
+            },
+            "message": {
+                "bsonType": "string",
+                "description": "Rendered log message"
+            },
+            "workflow_id": {
+                "bsonType": "string",
+                "description": "Associated workflow ID"
+            },
+            "workflow_run_id": {
+                "bsonType": "string",
+                "description": "Associated workflow run ID"
+            },
+            "workflow_type": {
+                "bsonType": ["string", "null"],
+                "description": "Associated workflow type"
+            },
+            "agent": {
+                "bsonType": ["string", "null"],
+                "description": "Associated agent"
+            },
+            "participant_id": {
+                "bsonType": ["string", "null"],
+                "description": "Associated participant ID"
+            },
+            "properties": {
+                "bsonType": "object",
+                "description": "Additional metadata related to the log"
+            },
+            "exception": {
+                "bsonType": ["string", "null"],
+                "description": "Exception details if available"
+            },
+            "updated_at": {
+                "bsonType": ["date", "null"],
+                "description": "Timestamp of last update"
+            }
+        },
+        "indexes": [
+            {
+                "keys": { "tenant_id": 1, "created_at": -1 }
+            },
+            {
+                "keys": { "workflow_id": 1, "workflow_run_id": 1 }
+            },
+            {
+                "keys": { "level": 1 }
+            },
+            {
+                "keys": { "tenant_id": 1, "agent": 1, "participant_id": 1 }
+            },
+            {
+                "keys": { "tenant_id": 1, "agent": 1, "workflow_type": 1 }
+            },
+            {
+                "keys": { "tenant_id": 1, "agent": 1, "workflow_id": 1 }
+            },
+            {
+                "keys": { "created_at": 1 },
+                "expireAfterSeconds": 2592000,
+                "name": "logs_ttl_created_at",
+                "description": "TTL index to automatically expire logs after 30 days (2592000 seconds)"
+            }
+        ]
+    }
+}

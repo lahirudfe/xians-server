@@ -1,0 +1,73 @@
+using Microsoft.AspNetCore.Mvc;
+using Features.AgentApi.Auth;
+using Shared.Auth;
+using Shared.Data.Models.Usage;
+using Shared.Services;
+
+namespace Features.AgentApi.Endpoints;
+
+public static class UsageEventEndpoints
+{
+    public static void MapUsageEventEndpoints(this WebApplication app)
+    {
+        var group = app.MapGroup("/api/agent/usage")
+            .WithTags("AgentAPI - Usage")
+            .RequiresCertificate();
+
+        group.MapPost("/report", async (
+            [FromBody] UsageReportRequest request,
+            [FromServices] ITenantContext tenantContext,
+            [FromServices] IUsageEventService usageService,
+            CancellationToken cancellationToken) =>
+        {
+            if (request == null)
+            {
+                return Results.BadRequest("Request payload is required.");
+            }
+
+            if (request.Metrics == null || request.Metrics.Count == 0)
+            {
+                return Results.BadRequest("At least one metric must be provided.");
+            }
+
+            // Validate metrics
+            foreach (var metric in request.Metrics)
+            {
+                if (string.IsNullOrWhiteSpace(metric.Category))
+                {
+                    return Results.BadRequest("Metric category is required.");
+                }
+
+                if (string.IsNullOrWhiteSpace(metric.Type))
+                {
+                    return Results.BadRequest("Metric type is required.");
+                }
+
+                if (metric.Value < 0)
+                {
+                    return Results.BadRequest($"Metric value cannot be negative: {metric.Type}");
+                }
+            }
+
+            // Use TenantId from request if provided, otherwise from certificate context
+            var tenantId = request.TenantId ?? tenantContext.TenantId;
+            if (string.IsNullOrWhiteSpace(tenantId))
+            {
+                return Results.BadRequest("Tenant context is not available.");
+            }
+
+            var participantId = request.ParticipantId ?? tenantContext.LoggedInUser;
+
+            await usageService.RecordAsync(request, tenantId, participantId, cancellationToken);
+
+            return Results.Accepted();
+        })
+        .Produces(StatusCodes.Status202Accepted)
+        .ProducesProblem(StatusCodes.Status400BadRequest)
+        .ProducesProblem(StatusCodes.Status500InternalServerError)
+        
+        .WithSummary("Report flexible usage metrics")
+        .WithDescription("Reports usage metrics using the flexible metrics array format. ");
+    }
+}
+

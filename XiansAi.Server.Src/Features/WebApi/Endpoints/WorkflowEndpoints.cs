@@ -1,0 +1,119 @@
+using Microsoft.AspNetCore.Mvc;
+using Features.WebApi.Services;
+using Features.WebApi.Auth;
+using Shared.Utils.Services;
+
+namespace Features.WebApi.Endpoints;
+
+public static class WorkflowEndpoints
+{
+    public static void MapWorkflowEndpoints(this WebApplication app)
+    {
+        // Map workflow endpoints with common attributes
+        var workflowsGroup = app.MapGroup("/api/client/workflows")
+            .WithTags("WebAPI - Workflows")
+            .RequiresValidTenant()
+            .RequireAuthorization();
+
+        workflowsGroup.MapGet("/", async (
+            [FromQuery] string workflowId,
+            [FromQuery] string? runId,
+            [FromServices] IWorkflowFinderService endpoint) =>
+        {
+            var result = await endpoint.GetWorkflow(workflowId, runId);
+            return result.ToHttpResult();
+        })
+        .WithName("Get Workflow")
+        
+        .WithSummary("Get workflow by ID")
+        .WithDescription("Retrieves detailed information about a specific workflow by its workflow ID and optional run ID (passed as query parameters). Supports complex workflow IDs with special characters and embedded URLs.");
+
+        workflowsGroup.MapPost("/", async (
+            [FromBody] WorkflowRequest request,
+            [FromServices] IWorkflowStarterService endpoint) =>
+        {
+            var result = await endpoint.HandleStartWorkflow(request);
+            return result.ToHttpResult();
+        })
+        .WithName("Create New Workflow")
+        ;
+
+        workflowsGroup.MapGet("/events", async (
+            [FromQuery] string workflowId,
+            [FromServices] IWorkflowEventsService endpoint) =>
+        {
+            var result = await endpoint.GetWorkflowEvents(workflowId);
+            return result.ToHttpResult();
+        })
+        .WithName("Get Workflow Events")
+        
+        .WithSummary("Get workflow events")
+        .WithDescription("Retrieves the event history for a specific workflow (pass workflowId as query parameter)");
+
+        workflowsGroup.MapGet("/list", async (
+            [FromQuery] string? status,
+            [FromQuery] string? agent,
+            [FromQuery] string? workflowType,
+            [FromQuery] string? user,
+            [FromQuery] string? idPostfix,
+            [FromQuery] int? pageSize,
+            [FromQuery] string? pageToken,
+            [FromServices] IWorkflowFinderService endpoint) =>
+        {
+            var result = await endpoint.GetWorkflows(status, agent, workflowType, user, idPostfix, pageSize, pageToken);
+            return result.ToHttpResult();
+        })
+        .WithName("Get Workflows")
+        
+        .WithSummary("Get workflows with optional filters and pagination")
+        .WithDescription("Retrieves workflows with optional filtering by status, agent, workflow type, user, and activation (idPostfix), with pagination support");
+
+        workflowsGroup.MapGet("/types", async (
+            [FromQuery] string agent,
+            [FromServices] IWorkflowFinderService endpoint) =>
+        {
+            var result = await endpoint.GetWorkflowTypes(agent);
+            return result.ToHttpResult();
+        })
+        .WithName("Get Workflow Types")
+        
+        .WithSummary("Get workflow types for an agent")
+        .WithDescription("Retrieves all unique workflow types for a specific agent");
+
+        workflowsGroup.MapPost("/cancel", async (
+            [FromQuery] string workflowId,
+            [FromQuery] bool force,
+            [FromServices] IWorkflowCancelService endpoint) =>
+        {
+            var result = await endpoint.CancelWorkflow(workflowId, force);
+            return result.ToHttpResult();
+        })
+        .WithName("Cancel Workflow")
+        
+        .WithSummary("Cancel a workflow")
+        .WithDescription("Cancels a running workflow (pass workflowId and force as query parameters)");
+
+        workflowsGroup.MapPost("/cancel-all", async (
+            [FromQuery] bool force,
+            [FromServices] IWorkflowCancelService endpoint) =>
+        {
+            var result = await endpoint.CancelAllWorkflows(force);
+            return result.ToHttpResult();
+        })
+        .WithName("Cancel All Workflows")
+        
+        .WithSummary("Cancel all running workflows for the tenant")
+        .WithDescription("Cancels all running workflows belonging to the current tenant. Pass force=true to terminate immediately instead of a graceful cancel.");
+
+        workflowsGroup.MapGet("/events/stream", (
+            [FromServices] IWorkflowEventsService endpoint,
+            [FromQuery] string workflowId) =>
+        {
+            return endpoint.StreamWorkflowEvents(workflowId);
+        })
+        .WithName("Stream Workflow Events")
+        
+        .WithSummary("Stream workflow events in real-time")
+        .WithDescription("Provides a server-sent events (SSE) stream of workflow activity events (pass workflowId as query parameter)");
+    }
+} 

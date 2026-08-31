@@ -1,0 +1,90 @@
+using Microsoft.AspNetCore.Mvc;
+using Features.WebApi.Auth;
+using Shared.Services;
+using Shared.Utils.Services;
+
+namespace Features.WebApi.Endpoints;
+
+public static class KnowledgeEndpoints
+{
+    public static void MapKnowledgeEndpoints(this WebApplication app)
+    {
+        // Map instruction endpoints with common attributes
+        var knowledgeGroup = app.MapGroup("/api/client/knowledge")
+            .WithTags("WebAPI - Knowledge")
+            .RequiresValidTenant()
+            .RequireAuthorization();
+
+        knowledgeGroup.MapGet("/latest/all", async (
+            [FromQuery] string agent,
+            [FromServices] IKnowledgeService endpoint) =>
+        {
+            return await endpoint.GetLatestAll(agent);
+        })
+        .WithName("Get Latest Instructions")
+        ;
+        
+        knowledgeGroup.MapGet("/{id}", async (
+            string id,
+            [FromServices] IKnowledgeService endpoint) =>
+        {
+            return await endpoint.GetById(id);
+        })
+        .WithName("Get Instruction")
+        ;
+
+        knowledgeGroup.MapPost("/", async (
+            [FromBody] KnowledgeRequest request,
+            [FromServices] IKnowledgeService endpoint) =>
+        {
+            return await endpoint.Create(request);
+        })
+        .WithName("Create Instruction")
+        ;
+
+        knowledgeGroup.MapGet("/latest", async (
+            [FromQuery] string name,
+            [FromQuery] string agent,
+            [FromServices] IKnowledgeService endpoint) =>
+        {
+            var result = await endpoint.GetLatestByNameAsync(name, agent);
+            return result.ToHttpResult();
+        })
+        .WithName("Get Latest Instruction")
+        ;
+
+        knowledgeGroup.MapDelete("/{id}", async (
+            string id,
+            [FromServices] IKnowledgeService endpoint) =>
+        {
+            return await endpoint.DeleteById(id);
+        })
+        .WithName("Delete Instruction")
+        ;
+
+        knowledgeGroup.MapDelete("/all", async (
+            [FromQuery] string name,
+            [FromQuery] string agent,
+            [FromServices] IKnowledgeService endpoint) =>
+        {
+            var request = new DeleteAllVersionsRequest 
+            {
+                Name = name,
+                Agent = agent
+            };
+            return await endpoint.DeleteAllVersions(request);
+        })
+        .WithName("Delete All Versions")
+        ;
+
+        knowledgeGroup.MapGet("/versions", async (
+            [FromQuery] string name,
+            [FromQuery] string? agent,
+            [FromServices] IKnowledgeService endpoint) =>
+        {
+            return await endpoint.GetVersions(name, agent);
+        })
+        .WithName("Get Knowledge Versions")
+        ;
+    }
+} 

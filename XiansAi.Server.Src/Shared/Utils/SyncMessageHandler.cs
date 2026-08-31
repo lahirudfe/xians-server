@@ -1,0 +1,97 @@
+using Shared.Services;
+using Shared.Repositories;
+using Shared.Utils.Services;
+using Microsoft.Extensions.Logging;
+
+namespace Shared.Utils
+{
+    public class SyncMessageHandler
+    {
+        private readonly IMessageService _messageService;
+        private readonly IPendingRequestService _pendingRequestService;
+        private readonly ILogger<SyncMessageHandler> _logger;
+
+        public SyncMessageHandler(
+            IMessageService messageService, 
+            IPendingRequestService pendingRequestService,
+            ILogger<SyncMessageHandler> logger)
+        {
+            _messageService = messageService;
+            _pendingRequestService = pendingRequestService;
+            _logger = logger;
+        }
+
+        public async Task<object> ProcessSyncMessageAsync(
+            ChatOrDataRequest chatRequest,
+            MessageType messageType,
+            int timeoutSeconds,
+            CancellationToken cancellationToken,
+            MessageType? expectedResponseType = null)
+        {
+            if (string.IsNullOrEmpty(chatRequest.RequestId))
+            {
+                throw new ArgumentException("RequestId is required for sync messages", nameof(chatRequest));
+            }
+
+            // Heartbeat requests elicit Data response from agent ({ available: true }), not Heartbeat
+            var responseMessageType = expectedResponseType
+                ?? (messageType == MessageType.Heartbeat ? MessageType.Data : messageType);
+
+            try
+            {
+                // Start waiting for the response (this sets up the TaskCompletionSource)
+                var responseTask = _pendingRequestService.WaitForResponseAsync<ConversationMessage>(
+                    chatRequest.RequestId,
+                    TimeSpan.FromSeconds(timeoutSeconds),
+                    responseMessageType,
+                    cancellationToken);
+
+                // Process the incoming message asynchronously (using existing flow)
+                var processResult = await _messageService.ProcessIncomingMessage(chatRequest, messageType);
+
+                if (!processResult.IsSuccess)
+                {
+                    _pendingRequestService.CancelRequest(chatRequest.RequestId);
+                    return processResult.ToHttpResult();
+                }
+
+                // Wait for the response from the change stream
+                var response = await responseTask;
+
+                if (response == null)
+                {
+                    return Results.Problem("No response received within timeout period", statusCode: 408);
+                }
+
+                // Return the response message
+                return new
+                {
+                    ThreadId = processResult.Data,
+                    response.Text,
+                    response.ParticipantId,
+                    response.Data,
+                    response.CreatedAt,
+                    response.MessageType,
+                    response.Scope,
+                    response.RequestId,
+                    response.Hint
+                };
+            }
+            catch (TimeoutException)
+            {
+                return Results.Problem("Request timed out waiting for response", statusCode: 408);
+            }
+            catch (OperationCanceledException)
+            {
+                _pendingRequestService.CancelRequest(chatRequest.RequestId);
+                return Results.Problem("Request was cancelled", statusCode: 499);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error processing sync message request");
+                _pendingRequestService.CancelRequest(chatRequest.RequestId);
+                return Results.Problem("An error occurred while processing your request", statusCode: 500);
+            }
+        }
+    }
+}

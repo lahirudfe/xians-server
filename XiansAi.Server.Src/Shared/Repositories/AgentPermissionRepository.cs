@@ -1,0 +1,322 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Shared.Data;
+using Shared.Auth;
+using Shared.Utils;
+
+namespace Shared.Repositories;
+
+public interface IAgentPermissionRepository
+{
+    Task<Permission?> GetAgentPermissionsAsync(string agentName);
+    Task<string?> GetAgentTenantAsync(string agentName);
+    Task<bool> UpdateAgentPermissionsAsync(string agentName, Permission permissions);
+    Task<bool> AddUserToAgentAsync(string agentName, string userId, PermissionLevel permissionLevel);
+    Task<bool> RemoveUserFromAgentAsync(string agentName, string userId);
+    Task<bool> UpdateUserPermissionAsync(string agentName, string userId, PermissionLevel newPermissionLevel);
+    Task<List<string>> GetAgentNamesWithPermissionAsync(PermissionLevel requiredLevel);
+}
+
+public class AgentPermissionRepository : IAgentPermissionRepository
+{
+    private readonly IAgentRepository _agentRepository;
+    private readonly IFlowDefinitionRepository _flowDefinitionRepository;
+    private readonly ILogger<AgentPermissionRepository> _logger;
+    private readonly ITenantContext _tenantContext;
+    private readonly Dictionary<string, Permission?> _permissionsCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string?> _agentTenantCache = new(StringComparer.OrdinalIgnoreCase);
+
+    public AgentPermissionRepository(
+        IAgentRepository agentRepository,
+        IFlowDefinitionRepository flowDefinitionRepository,
+        ILogger<AgentPermissionRepository> logger,
+        ITenantContext tenantContext)
+    {
+        _agentRepository = agentRepository;
+        _flowDefinitionRepository = flowDefinitionRepository;
+        _logger = logger;
+        _tenantContext = tenantContext;
+    }
+
+    public async Task<Permission?> GetAgentPermissionsAsync(string agentName)
+    {
+        _logger.LogInformation("Getting permissions for agent: {AgentName}", LogSanitizer.Sanitize(agentName));
+
+        // Check cache first (request-scoped cache to avoid repeated DB calls)
+        if (_permissionsCache.TryGetValue(agentName, out var cachedPermissions))
+        {
+            _logger.LogDebug("Agent permissions cache hit for agent: {AgentName}", LogSanitizer.Sanitize(agentName));
+            return cachedPermissions;
+        }
+
+        var agent = await _agentRepository.GetByNameInternalAsync(agentName, _tenantContext.TenantId);
+
+        if (agent == null)
+        {
+            _logger.LogWarning("Agent not found: {AgentName}", LogSanitizer.Sanitize(agentName));
+            _permissionsCache[agentName] = null;
+            return null;
+        }
+
+        var permission = new Permission()
+        {
+            OwnerAccess = agent.OwnerAccess,
+            ReadAccess = agent.ReadAccess,
+            WriteAccess = agent.WriteAccess
+        };
+
+        _permissionsCache[agentName] = permission;
+        _logger.LogDebug("Agent permissions cache miss for agent: {AgentName}, loaded from DB", LogSanitizer.Sanitize(agentName));
+        return permission;
+    }
+
+    public async Task<string?> GetAgentTenantAsync(string agentName)
+    {
+        _logger.LogInformation("Getting tenant for agent: {AgentName}", LogSanitizer.Sanitize(agentName));
+
+        if (_agentTenantCache.TryGetValue(agentName, out var cachedTenant))
+        {
+            return cachedTenant;
+        }
+
+        var agent = await _agentRepository.GetByNameInternalAsync(agentName, _tenantContext.TenantId);
+        if (agent == null)
+        {
+            _logger.LogWarning("Agent not found: {AgentName}", LogSanitizer.Sanitize(agentName));
+            _agentTenantCache[agentName] = string.Empty;
+            return string.Empty;
+        }
+
+        _agentTenantCache[agentName] = agent.Tenant;
+        return agent.Tenant;
+    }
+
+    public async Task<bool> UpdateAgentPermissionsAsync(string agentName, Permission permissions)
+    {
+        _logger.LogInformation("Updating permissions for agent: {AgentName}", LogSanitizer.Sanitize(agentName));
+
+        // Use permission-aware method that checks if user has owner permission
+        var agentUpdated = await _agentRepository.UpdatePermissionsAsync(
+            agentName,
+            _tenantContext.TenantId,
+            CleanPermissionLevels(permissions),
+            _tenantContext.LoggedInUser,
+            _tenantContext.UserRoles);
+
+        if (!agentUpdated)
+        {
+            _logger.LogWarning("Failed to update permissions for agent {AgentName} - either not found or insufficient permissions", LogSanitizer.Sanitize(agentName));
+            return false;
+        }
+
+        // Invalidate cache since permissions have changed
+        _permissionsCache.Remove(agentName);
+        _logger.LogDebug("Invalidated permissions cache for agent: {AgentName}", LogSanitizer.Sanitize(agentName));
+
+        return true;
+    }
+
+    public async Task<bool> AddUserToAgentAsync(string agentName, string userId, PermissionLevel permissionLevel)
+    {
+        _logger.LogInformation("Adding user {UserId} to agent {AgentName} with permission level {PermissionLevel}",
+            userId, agentName, permissionLevel);
+
+        // Get the agent without permission check first, then check owner permission explicitly
+        var agent = await _agentRepository.GetByNameInternalAsync(agentName, _tenantContext.TenantId);
+        if (agent == null)
+        {
+            _logger.LogWarning("Agent not found: {AgentName}", LogSanitizer.Sanitize(agentName));
+            return false;
+        }
+
+        // Check if user has owner permission (required to add users)
+        if (!CheckPermissions(agent, PermissionLevel.Owner))
+        {
+            _logger.LogWarning("User {UserId} attempted to add user to agent {AgentName} without owner permission",
+                LogSanitizer.Sanitize(_tenantContext.LoggedInUser), LogSanitizer.Sanitize(agentName));
+            return false;
+        }
+
+        // Remove user from all permission levels first
+        agent.OwnerAccess.Remove(userId);
+        agent.WriteAccess.Remove(userId);
+        agent.ReadAccess.Remove(userId);
+
+        // Add user to the appropriate level
+        switch (permissionLevel)
+        {
+            case PermissionLevel.Owner:
+                agent.GrantOwnerAccess(userId);
+                break;
+            case PermissionLevel.Write:
+                agent.GrantWriteAccess(userId);
+                break;
+            case PermissionLevel.Read:
+                agent.GrantReadAccess(userId);
+                break;
+        }
+
+        // Use the internal update method since we've already verified permissions
+        var result = await _agentRepository.UpdateInternalAsync(agent.Id, agent);
+
+        if (result)
+        {
+            // Invalidate cache since permissions have changed
+            _permissionsCache.Remove(agentName);
+            _logger.LogDebug("Invalidated permissions cache for agent: {AgentName}", LogSanitizer.Sanitize(agentName));
+        }
+
+        return result;
+    }
+
+    public async Task<bool> RemoveUserFromAgentAsync(string agentName, string userId)
+    {
+        _logger.LogInformation("Removing user {UserId} from agent {AgentName}", LogSanitizer.Sanitize(userId), LogSanitizer.Sanitize(agentName));
+
+        // Get the agent without permission check first, then check owner permission explicitly
+        var agent = await _agentRepository.GetByNameInternalAsync(agentName, _tenantContext.TenantId);
+        if (agent == null)
+        {
+            _logger.LogWarning("Agent not found: {AgentName}", LogSanitizer.Sanitize(agentName));
+            return false;
+        }
+
+        // Check if user has owner permission (required to remove users)
+        if (!CheckPermissions(agent, PermissionLevel.Owner))
+        {
+            _logger.LogWarning("User {UserId} attempted to remove user from agent {AgentName} without owner permission",
+                LogSanitizer.Sanitize(_tenantContext.LoggedInUser), LogSanitizer.Sanitize(agentName));
+            return false;
+        }
+
+        // Track if any changes were made (for logging purposes)
+        bool wasUserFound = agent.OwnerAccess.Contains(userId) ||
+                           agent.WriteAccess.Contains(userId) ||
+                           agent.ReadAccess.Contains(userId);
+
+        // Remove user from all permission levels
+        agent.RevokeOwnerAccess(userId);
+        agent.RevokeWriteAccess(userId);
+        agent.RevokeReadAccess(userId);
+
+        // Use the internal update method since we've already verified permissions
+        var result = await _agentRepository.UpdateInternalAsync(agent.Id, agent);
+
+        if (result)
+        {
+            // Invalidate cache since permissions have changed
+            _permissionsCache.Remove(agentName);
+            _logger.LogDebug("Invalidated permissions cache for agent: {AgentName}", LogSanitizer.Sanitize(agentName));
+        }
+
+        // If the user wasn't found in any permission list, still consider it successful (idempotent operation)
+        if (!wasUserFound)
+        {
+            _logger.LogInformation("User {UserId} was not found in any permission lists for agent {AgentName}, operation considered successful", LogSanitizer.Sanitize(userId), LogSanitizer.Sanitize(agentName));
+            return true;
+        }
+
+        return result;
+    }
+
+    public async Task<bool> UpdateUserPermissionAsync(string agentName, string userId, PermissionLevel newPermissionLevel)
+    {
+        _logger.LogInformation("Updating permission for user {UserId} in agent {AgentName} to {PermissionLevel}",
+            userId, agentName, newPermissionLevel);
+
+        // First remove the user from all permission levels
+        await RemoveUserFromAgentAsync(agentName, userId);
+
+        // Then add them with the new permission level
+        return await AddUserToAgentAsync(agentName, userId, newPermissionLevel);
+    }
+
+    private void SyncPermissionsToFlowDefinitions(string agentName, Permission permissions)
+    {
+        // Flow definitions no longer have permissions - they inherit from agent permissions
+        // This method is no longer needed but kept for backward compatibility
+        _logger.LogInformation("Permission sync to flow definitions is no longer needed for agent {AgentName}", LogSanitizer.Sanitize(agentName));
+    }
+
+    private Permission CleanPermissionLevels(Permission permissions)
+    {
+        var cleanedPermissions = new Permission();
+
+        // Process owner access first (highest level)
+        foreach (var userId in permissions.OwnerAccess)
+        {
+            cleanedPermissions.OwnerAccess.Add(userId);
+        }
+
+        // Process write access (remove users who are already owners)
+        foreach (var userId in permissions.WriteAccess)
+        {
+            if (!cleanedPermissions.OwnerAccess.Contains(userId))
+            {
+                cleanedPermissions.WriteAccess.Add(userId);
+            }
+        }
+
+        // Process read access (remove users who are already owners or writers)
+        foreach (var userId in permissions.ReadAccess)
+        {
+            if (!cleanedPermissions.OwnerAccess.Contains(userId) &&
+                !cleanedPermissions.WriteAccess.Contains(userId))
+            {
+                cleanedPermissions.ReadAccess.Add(userId);
+            }
+        }
+
+        return cleanedPermissions;
+    }
+
+    private bool HasSystemAccess(string? agentTenantId)
+    {
+        // System admin has access to everything
+        if (_tenantContext.UserRoles.Contains(SystemRoles.SysAdmin))
+            return true;
+
+        // Tenant admin has access to everything in their tenant
+        if (_tenantContext.UserRoles.Contains(SystemRoles.TenantAdmin))
+        {
+            return !string.IsNullOrEmpty(agentTenantId) &&
+                   _tenantContext.TenantId.Equals(agentTenantId, StringComparison.OrdinalIgnoreCase);
+        }
+
+        return false;
+    }
+
+    private bool CheckPermissions(Agent agent, PermissionLevel requiredLevel)
+    {
+        if (HasSystemAccess(agent.Tenant))
+        {
+            return true;
+        }
+
+        return agent?.HasPermission(_tenantContext.LoggedInUser, _tenantContext.UserRoles, requiredLevel) ?? false;
+    }
+
+    public async Task<List<string>> GetAgentNamesWithPermissionAsync(PermissionLevel requiredLevel)
+    {
+        _logger.LogInformation("Getting agent names with {PermissionLevel} permission for user {UserId} in tenant {TenantId}", 
+            requiredLevel, _tenantContext.LoggedInUser, _tenantContext.TenantId);
+
+        var agents = await _agentRepository.GetAgentsWithPermissionAsync(_tenantContext.LoggedInUser, _tenantContext.TenantId);
+        
+        // Filter agents based on required permission level
+        var authorizedAgents = agents.Where(agent => 
+        {
+            if (HasSystemAccess(agent.Tenant))
+                return true;
+            
+            return agent.HasPermission(_tenantContext.LoggedInUser, _tenantContext.UserRoles, requiredLevel);
+        }).ToList();
+
+        var agentNames = authorizedAgents.Select(a => a.Name).ToList();
+        
+        _logger.LogInformation("User has {PermissionLevel} access to {Count} agents", requiredLevel, agentNames.Count);
+        
+        return agentNames;
+    }
+}

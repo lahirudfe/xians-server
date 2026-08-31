@@ -1,0 +1,560 @@
+# yaml-language-server: $schema=./mongodb-indexes.schema.json
+
+agents:
+  - name: name_1_tenant_1
+    keys:
+      name: asc
+      tenant: asc
+    unique: true
+  - name: tenant_-1
+    keys:
+      tenant: desc
+  - name: tenant_1_created_at_-1
+    keys:
+      tenant: asc
+      created_at: desc
+    background: true
+  - name: owner_access_1
+    keys:
+      owner_access: asc
+    background: true
+  - name: read_access_1
+    keys:
+      read_access: asc
+    background: true
+  - name: write_access_1
+    keys:
+      write_access: asc
+    background: true
+
+flow_definitions:
+  - name: created_at_-1
+    keys:
+      created_at: desc
+  - name: agent_1
+    keys:
+      agent: asc
+  - name: workflow_type_1_created_at_-1
+    keys:
+      workflow_type: asc
+      created_at: desc
+  - name: updated_at_-1
+    keys:
+      updated_at: desc
+  - name: hash_1_workflow_type_1
+    keys:
+      hash: asc
+      workflow_type: asc
+  - name: tenant_1_system_scoped_1
+    keys:
+      tenant: asc
+      system_scoped: asc
+    background: true
+  - name: workflow_type_1_tenant_1_system_scoped_1
+    keys:
+      workflow_type: asc
+      tenant: asc
+      system_scoped: asc
+    background: true
+  - name: agent_1_tenant_1_system_scoped_1
+    keys:
+      agent: asc
+      tenant: asc
+      system_scoped: asc
+    background: true
+  - name: hash_1_workflow_type_1_tenant_1_system_scoped_1
+    keys:
+      hash: asc
+      workflow_type: asc
+      tenant: asc
+      system_scoped: asc
+    background: true
+
+processed_event:
+  - name: processed_event_id
+    keys:
+      document_id: asc
+    unique: true
+
+conversation_message:
+  - name: bot_message_lookup
+    keys:
+      tenant_id: asc
+      workflow_id: asc
+      participant_id: asc
+      created_at: desc
+    background: true
+  - name: thread_message_lookup
+    keys:
+      tenant_id: asc
+      thread_id: asc
+      created_at: desc
+    background: true
+  # perf: compound index for chatOnly=true queries (agent thread-history fetch default).
+  # Previously the query matched on (tenant_id, thread_id) then post-filtered on
+  # message_type in memory. Adding message_type to the index lets MongoDB apply the
+  # equality predicate during the index scan, eliminating the post-filter step.
+  - name: thread_chat_message_lookup
+    keys:
+      tenant_id: asc
+      thread_id: asc
+      message_type: asc
+      created_at: desc
+    background: true
+  - name: bot_scope_lookup
+    keys:
+      tenant_id: asc
+      workflow_id: asc
+      participant_id: asc
+      scope: asc
+      created_at: desc
+    background: true
+    sparse: true
+  - name: thread_scope_lookup
+    keys:
+      tenant_id: asc
+      thread_id: asc
+      scope: asc
+      created_at: desc
+    background: true
+  # perf: covers GetLastIncomingOriginAndDataAsync (tenant + thread + direction + scope + created_at)
+  # used when auto-populating Origin/Data on outbound replies and the in-memory cache misses.
+  - name: thread_incoming_origin_lookup
+    keys:
+      tenant_id: asc
+      thread_id: asc
+      direction: asc
+      scope: asc
+      created_at: desc
+    background: true
+  # perf: compound index for request_id lookups used by PendingRequestService / change stream
+  # to correlate outgoing messages back to their originating sync request.
+  - name: outgoing_request_id_lookup
+    keys:
+      tenant_id: asc
+      request_id: asc
+      direction: asc
+    background: true
+    sparse: true
+  - name: tenant_lookup
+    keys:
+      tenant_id: asc
+  - name: message_status
+    keys:
+      tenant_id: asc
+      status: asc
+  - name: message_type_1
+    keys:
+      message_type: asc
+  # TTL on expires_at: heartbeat messages use 1h, other messages use 180d
+  - name: conversation_message_ttl
+    keys:
+      expires_at: asc
+    expire_after: 0s
+    background: true
+
+
+conversation_thread:
+  - name: thread_lookup
+    keys:
+      tenant_id: asc
+      workflow_id: asc
+      participant_id: asc
+    unique: true
+  - name: thread_status_lookup
+    keys:
+      tenant_id: asc
+      status: asc
+  - name: thread_updated_at
+    keys:
+      updated_at: desc
+  - name: tenant_agent_lookup
+    keys:
+      tenant_id: asc
+      agent: asc
+
+certificates:
+  - name: Thumbprint_1
+    keys:
+      Thumbprint: asc
+    unique: true
+  - name: TenantId_1
+    keys:
+      TenantId: asc
+  - name: ExpiresAt_1
+    keys:
+      ExpiresAt: asc
+  - name: TenantId_1_IssuedTo_1
+    keys:
+      TenantId: asc
+      IssuedTo: asc
+
+tenants:
+  - name: tenant_id_1
+    keys:
+      tenant_id: asc
+    unique: true
+  - name: domain_1
+    keys:
+      domain: asc
+  - name: created_by_1
+    keys:
+      created_by: asc
+
+logs:
+  - name: level_1_tenant_id_1_created_at_-1_workflow_type_1_autocreated
+    keys:
+      level: asc
+      tenant_id: asc
+      created_at: desc
+      workflow_type: asc
+  - name: workflow_run_id_1_autocreated
+    keys:
+      workflow_run_id: asc
+  - name: logs_ttl_created_at
+    keys:
+      created_at: asc
+    expire_after: 15d
+    background: true
+  - name: tenant_id_1_agent_1_participant_id_1
+    keys:
+      tenant_id: asc
+      agent: asc
+      participant_id: asc
+  - name: tenant_id_1_agent_1_participant_id_1_created_at_-1
+    keys:
+      tenant_id: asc
+      agent: asc
+      participant_id: asc
+      created_at: desc
+    background: true
+  - name: tenant_id_1_workflow_type_1_level_1
+    keys:
+      tenant_id: asc
+      workflow_type: asc
+      level: asc
+  - name: tenant_id_1_created_at_-1
+    keys:
+      tenant_id: asc
+      created_at: desc
+    background: true
+  - name: tenant_id_1_activation_1_created_at_-1
+    keys:
+      tenant_id: asc
+      activation: asc
+      created_at: desc
+    background: true
+  - name: tenant_id_1_workflow_id_1_created_at_-1
+    keys:
+      tenant_id: asc
+      workflow_id: asc
+      created_at: desc
+    background: true
+  - name: tenant_id_1_agent_1_created_at_-1
+    keys:
+      tenant_id: asc
+      agent: asc
+      created_at: desc
+    background: true
+
+message_feedback:
+  - name: tenant_id_1_message_id_1
+    keys:
+      tenant_id: asc
+      message_id: asc
+    unique: true
+  - name: tenant_id_1_submitted_at_-1
+    keys:
+      tenant_id: asc
+      submitted_at: desc
+    background: true
+  - name: tenant_id_1_star_rating_1_submitted_at_-1
+    keys:
+      tenant_id: asc
+      star_rating: asc
+      submitted_at: desc
+    background: true
+
+api_keys:
+  - name: tenant_name_unique
+    keys:
+      tenant_id: asc
+      name: asc
+    unique: true
+  - name: tenant_id_idx
+    keys:
+      tenant_id: asc
+  - name: hashed_key_idx
+    keys:
+      hashed_key: asc
+
+users:
+  - name: user_id_1
+    keys:
+      user_id: asc
+    unique: true
+  - name: email_1
+    keys:
+      email: asc
+  - name: is_sys_admin_1
+    keys:
+      is_sys_admin: asc
+  - name: tenant_roles_tenant_approved
+    keys:
+      "tenant_roles.tenant": asc
+      "tenant_roles.is_approved": asc
+
+user_invitations:
+  - name: tenant_id_1
+    keys:
+      tenant_id: asc
+  - name: token_1
+    keys:
+      token: asc
+    unique: true
+  - name: email_1_status_1
+    keys:
+      email: asc
+      status: asc
+
+knowledge:
+  - name: version_1
+    keys:
+      version: asc
+  - name: name_1_agent_1_tenant_id_1
+    keys:
+      name: asc
+      agent: asc
+      tenant_id: asc
+  - name: agent_1_tenant_id_1
+    keys:
+      agent: asc
+      tenant_id: asc
+    background: true
+  - name: activation_name_1
+    keys:
+      activation_name: asc
+    background: true
+    sparse: true
+  - name: name_1_version_1_agent_1_tenant_id_1_activation_name_1_system_scoped_1
+    keys:
+      name: asc
+      version: asc
+      agent: asc
+      tenant_id: asc
+      activation_name: asc
+      system_scoped: asc
+    unique: true
+    sparse: true
+    background: true
+
+documents:
+  - name: tenant_agent_type_created
+    keys:
+      tenant_id: asc
+      agent_id: asc
+      type: asc
+      created_at: desc
+    background: true
+  - name: tenant_agent_type
+    keys:
+      tenant_id: asc
+      agent_id: asc
+      type: asc
+    background: true
+  - name: tenant_type_key
+    keys:
+      tenant_id: asc
+      type: asc
+      key: asc
+    background: true
+  - name: documents_ttl
+    keys:
+      expires_at: asc
+    expire_after: 0s
+    background: true
+    sparse: true
+
+# secret_vault_values: secret value documents written by DatabaseSecretStoreProvider.
+# Lookup is always by _id (the SecretVault Mongo _id) which has an implicit unique index;
+# no additional indexes are needed. Listed here for documentation only.
+
+# DEPRECATED: Old nested design - kept for reference only
+# usage_events:
+#   - name: idx_tenant_date
+#     keys:
+#       tenant_id: asc
+#       created_at: desc
+#   - name: idx_tenant_participant_date
+#     keys:
+#       tenant_id: asc
+#       participant_id: asc
+#       created_at: desc
+
+# CURRENT: Flattened metrics design - optimized for query performance
+usage_metrics:
+  - name: idx_tenant_date
+    keys:
+      tenant_id: asc
+      created_at: desc
+    background: true
+  - name: idx_tenant_category_type_date
+    keys:
+      tenant_id: asc
+      category: asc
+      type: asc
+      created_at: desc
+    background: true
+  - name: idx_tenant_agent_date
+    keys:
+      tenant_id: asc
+      agent_name: asc
+      created_at: desc
+    background: true
+  - name: idx_tenant_participant_date
+    keys:
+      tenant_id: asc
+      participant_id: asc
+      created_at: desc
+    background: true
+  - name: idx_tenant_agent_category_date
+    keys:
+      tenant_id: asc
+      agent_name: asc
+      category: asc
+      created_at: desc
+  # Admin Metrics Endpoints - Optimized indexes
+  - name: idx_admin_stats_query
+    keys:
+      tenant_id: asc
+      agent_name: asc
+      created_at: asc
+      category: asc
+      type: asc
+      activation_name: asc
+    background: true
+  - name: idx_admin_timeseries_query
+    keys:
+      tenant_id: asc
+      agent_name: asc
+      category: asc
+      type: asc
+      created_at: asc
+    background: true
+  - name: idx_admin_categories_discovery
+    keys:
+      tenant_id: asc
+      category: asc
+      type: asc
+    background: true
+  - name: idx_activation_metrics
+    keys:
+      tenant_id: asc
+      agent_name: asc
+      activation_name: asc
+      created_at: asc
+    background: true
+  - name: idx_tenant_participant_category_date
+    keys:
+      tenant_id: asc
+      participant_id: asc
+      category: asc
+      created_at: desc
+    background: true
+  - name: idx_workflow_type_category
+    keys:
+      tenant_id: asc
+      workflow_type: asc
+      category: asc
+      created_at: desc
+    background: true
+  - name: idx_activation_category_date
+    keys:
+      tenant_id: asc
+      activation_name: asc
+      category: asc
+      created_at: desc
+    background: true
+    sparse: true
+  - name: usage_metrics_ttl
+    keys:
+      created_at: asc
+    expire_after: 90d
+    background: true
+
+activations:
+  - name: tenant_id_1_name_1_agent_name_1_participant_id_1
+    keys:
+      tenant_id: asc
+      name: asc
+      agent_name: asc
+    unique: true
+    sparse: true
+  - name: tenant_id_1
+    keys:
+      tenant_id: asc
+    background: true
+  - name: agent_name_1_tenant_id_1
+    keys:
+      agent_name: asc
+      tenant_id: asc
+    background: true
+  - name: created_at_-1
+    keys:
+      created_at: desc
+    background: true
+  - name: tenant_id_1_created_at_-1
+    keys:
+      tenant_id: asc
+      created_at: desc
+    background: true
+  - name: agent_name_1_tenant_id_1_created_at_-1
+    keys:
+      agent_name: asc
+      tenant_id: asc
+      created_at: desc
+    background: true
+
+app_integrations:
+  - name: idx_tenant_id
+    keys:
+      tenant_id: asc
+  - name: idx_tenant_platform
+    keys:
+      tenant_id: asc
+      platform_id: asc
+  - name: idx_tenant_agent_activation
+    keys:
+      tenant_id: asc
+      agent_name: asc
+      activation_name: asc
+  - name: idx_workflow_id
+    keys:
+      workflow_id: asc
+  - name: idx_tenant_agent_activation_name_unique
+    keys:
+      tenant_id: asc
+      agent_name: asc
+      activation_name: asc
+      name: asc
+    unique: true
+
+webhook_deliveries:
+  # Drives the dispatcher's atomic claim query (status + due time).
+  - name: webhook_delivery_claim
+    keys:
+      status: asc
+      next_attempt_at: asc
+    background: true
+  # Audit lookups: "what did this user trigger, most recent first".
+  - name: webhook_delivery_actor
+    keys:
+      actor_user_id: asc
+      created_at: desc
+    background: true
+  # TTL cleanup: remove delivery rows 15 days after creation.
+  - name: webhook_delivery_ttl
+    keys:
+      created_at: asc
+    expire_after: 15d
+    background: true

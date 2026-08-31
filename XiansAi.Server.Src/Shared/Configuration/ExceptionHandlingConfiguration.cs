@@ -1,0 +1,218 @@
+using Microsoft.AspNetCore.Diagnostics;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Authorization.Policy;
+using Shared.Exceptions;
+using System.Text;
+using System.Text.Json;
+using Shared.Utils;
+
+namespace Features.Shared.Configuration;
+
+public static class ExceptionHandlingConfiguration
+{
+    public static WebApplication UseExceptionHandlingConfiguration(this WebApplication app)
+    {
+        app.UseExceptionHandler(errorApp =>
+        {
+            errorApp.Run(async context =>
+            {
+                var exception = context.Features.Get<IExceptionHandlerFeature>()?.Error;
+                var logger = context.RequestServices.GetRequiredService<ILogger<Program>>();
+                
+                context.Response.ContentType = "application/json";
+                
+                switch (exception)
+                {
+                    case BadHttpRequestException badRequestEx when badRequestEx.InnerException is JsonException jsonEx:
+                        // Handle model binding validation errors - log detailed error server-side
+                        logger.LogInformation("Model binding error: {Message}", jsonEx.Message);
+                        context.Response.StatusCode = StatusCodes.Status400BadRequest;
+                        await context.Response.WriteAsJsonAsync(new 
+                        { 
+                            error = "Invalid request format",
+                            message = "The request body contains invalid JSON format"
+                        });
+                        break;
+                        
+                    case BadHttpRequestException badRequestEx:
+                        // Handle other bad request exceptions - log detailed error server-side
+                        logger.LogInformation("Bad request error: {Message}", badRequestEx.Message);
+                        context.Response.StatusCode = StatusCodes.Status400BadRequest;
+                        await context.Response.WriteAsJsonAsync(new 
+                        { 
+                            error = "Bad request",
+                            message = "The request is invalid"
+                        });
+                        break;
+
+                    case InvalidWorkflowIdentifierException workflowEx:
+                        // Caller mistake rather than a server fault, so the full explanation is
+                        // safe and useful to return.
+                        logger.LogInformation("Invalid workflow identifier: {Message}", LogSanitizer.Sanitize(workflowEx.Message));
+                        context.Response.StatusCode = StatusCodes.Status400BadRequest;
+                        await context.Response.WriteAsJsonAsync(new
+                        {
+                            error = "Invalid workflow identifier",
+                            message = workflowEx.Message
+                        });
+                        break;
+
+                    case TenantNotFoundException tenantEx:
+                        logger.LogInformation("Tenant not found: {TenantId}", tenantEx.TenantId);
+                        context.Response.StatusCode = StatusCodes.Status404NotFound;
+                        await context.Response.WriteAsJsonAsync(new 
+                        { 
+                            error = "Not found",
+                            message = tenantEx.Message
+                        });
+                        break;
+                        
+                    default:
+                        // Handle other exceptions - log detailed error server-side only
+                        logger.LogError(exception, "An unhandled exception occurred");
+                        context.Response.StatusCode = StatusCodes.Status500InternalServerError;
+                        await context.Response.WriteAsJsonAsync(new 
+                        { 
+                            error = "Internal server error",
+                            message = "An error occurred while processing your request"
+                        });
+                        break;
+
+                }
+            });
+        });
+        
+        return app;
+    }
+}
+
+/// <summary>
+/// Custom authorization middleware result handler that provides detailed error messages
+/// </summary>
+public class AuthorizationMiddlewareResultHandler : IAuthorizationMiddlewareResultHandler
+{
+    private readonly ILogger<AuthorizationMiddlewareResultHandler> _logger;
+
+    public AuthorizationMiddlewareResultHandler(ILogger<AuthorizationMiddlewareResultHandler> logger)
+    {
+        _logger = logger;
+    }
+
+    public async Task HandleAsync(
+        RequestDelegate next,
+        HttpContext context,
+        AuthorizationPolicy policy,
+        PolicyAuthorizationResult authorizeResult)
+    {
+        // If authorization succeeded, continue with the request
+        if (authorizeResult.Succeeded)
+        {
+            await next(context);
+            return;
+        }
+
+        // If the user is not authenticated, return 401
+        if (authorizeResult.Challenged)
+        {
+            // Check if response has already started
+            if (context.Response.HasStarted)
+            {
+                _logger.LogWarning("Cannot write 401 response - response has already started for path: {Path}", LogSanitizer.Sanitize(context.Request.Path));
+                return;
+            }
+
+            // Surface the specific failure reason recorded by the authentication handler
+            // (e.g. "Invalid API key", "Invalid API key format") instead of a generic
+            // message, so callers can distinguish a credential mismatch from a missing one.
+            var failureMessage = context.Items.TryGetValue(
+                    Features.AdminApi.Auth.AdminEndpointAuthenticationHandler.FailureReasonItemKey,
+                    out var reason)
+                ? reason as string
+                : null;
+
+            var message = !string.IsNullOrEmpty(failureMessage)
+                ? failureMessage!
+                : "Authentication is required to access this resource";
+
+            var responseBody = new
+            {
+                error = "Unauthorized",
+                message
+            };
+            
+            // Serialize to string first, then write as bytes
+            var jsonString = JsonSerializer.Serialize(responseBody, new JsonSerializerOptions 
+            { 
+                PropertyNamingPolicy = JsonNamingPolicy.CamelCase 
+            });
+            var bytes = Encoding.UTF8.GetBytes(jsonString);
+            
+            // Set response properties BEFORE writing
+            context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            context.Response.ContentType = "application/json; charset=utf-8";
+            context.Response.ContentLength = bytes.Length;
+            
+            await context.Response.Body.WriteAsync(bytes, 0, bytes.Length);
+            await context.Response.Body.FlushAsync();
+            await context.Response.CompleteAsync();
+            
+            _logger.LogWarning("Authentication challenge returned for path: {Path}, wrote response body ({Length} bytes): {JsonString}", 
+                LogSanitizer.Sanitize(context.Request.Path), bytes.Length, LogSanitizer.Sanitize(jsonString));
+            return;
+        }
+
+        // If authorization failed (403), provide detailed error message
+        if (authorizeResult.Forbidden)
+        {
+            // Check if response has already started
+            if (context.Response.HasStarted)
+            {
+                _logger.LogWarning("Cannot write 403 response - response has already started for path: {Path}", LogSanitizer.Sanitize(context.Request.Path));
+                return;
+            }
+
+            // Extract failure reasons
+            var failureReasons = authorizeResult.AuthorizationFailure?.FailureReasons
+                .Select(r => r.Message)
+                .Where(m => !string.IsNullOrEmpty(m))
+                .ToList() ?? new List<string>();
+
+            var errorMessage = failureReasons.Any()
+                ? string.Join("; ", failureReasons)
+                : "You do not have permission to access this resource";
+
+            _logger.LogInformation("Authorization forbidden for path: {Path}, Reasons: {Reasons}", 
+                LogSanitizer.Sanitize(context.Request.Path), 
+                LogSanitizer.Sanitize(string.Join("; ", failureReasons)));
+
+            var responseBody = new
+            {
+                error = "Forbidden",
+                message = errorMessage
+            };
+
+            // Serialize to string first, then write as bytes
+            var jsonString = JsonSerializer.Serialize(responseBody, new JsonSerializerOptions 
+            { 
+                PropertyNamingPolicy = JsonNamingPolicy.CamelCase 
+            });
+            var bytes = Encoding.UTF8.GetBytes(jsonString);
+            
+            // Set response properties BEFORE writing
+            context.Response.StatusCode = StatusCodes.Status403Forbidden;
+            context.Response.ContentType = "application/json; charset=utf-8";
+            context.Response.ContentLength = bytes.Length;
+            
+            await context.Response.Body.WriteAsync(bytes, 0, bytes.Length);
+            await context.Response.Body.FlushAsync();
+            await context.Response.CompleteAsync();
+            
+            _logger.LogInformation("Wrote 403 response body ({Length} bytes): {JsonString}", bytes.Length, LogSanitizer.Sanitize(jsonString));
+            
+            return;
+        }
+
+        // If we get here, something unexpected happened - just continue with the request
+        await next(context);
+    }
+} 

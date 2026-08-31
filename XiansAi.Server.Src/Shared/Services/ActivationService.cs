@@ -1,0 +1,732 @@
+using MongoDB.Bson;
+using MongoDB.Driver;
+using Shared.Data.Models;
+using Shared.Repositories;
+using Shared.Utils.Services;
+using Shared.Utils.Temporal;
+using Features.WebApi.Services;
+using Shared.Utils;
+
+namespace Shared.Services;
+
+public interface IActivationService
+{
+    Task<ServiceResult<AgentActivation>> CreateActivationAsync(CreateActivationRequest request, string userId, string tenantId);
+    Task<ServiceResult<AgentActivation>> UpdateActivationAsync(string activationId, UpdateActivationRequest request, string tenantId);
+    Task<ServiceResult<AgentActivation>> GetActivationByIdAsync(string id);
+    Task<ServiceResult<List<AgentActivation>>> GetActivationsByTenantAsync(string tenantId, string? agentName = null);
+    Task<ServiceResult<AgentActivation>> ActivateAgentAsync(string activationId, string tenantId, ActivationWorkflowConfiguration? workflowConfiguration = null);
+    Task<ServiceResult<AgentActivation>> DeactivateAgentAsync(string activationId, string tenantId);
+    Task<ServiceResult<bool>> DeleteActivationAsync(string activationId);
+}
+
+public class CreateActivationRequest
+{
+    public required string Name { get; set; }
+    public required string AgentName { get; set; }
+    public string? Description { get; set; }
+    public string? ParticipantId { get; set; }
+    public ActivationWorkflowConfiguration? WorkflowConfiguration { get; set; }
+}
+
+public class UpdateActivationRequest
+{
+    public string? Name { get; set; }
+    public string? Description { get; set; }
+    public string? ParticipantId { get; set; }
+    public ActivationWorkflowConfiguration? WorkflowConfiguration { get; set; }
+}
+
+/// <summary>
+/// Request model for activating an agent with optional workflow configuration.
+/// </summary>
+public class ActivateAgentRequest
+{
+    public ActivationWorkflowConfiguration? WorkflowConfiguration { get; set; }
+}
+
+/// <summary>
+/// Service for managing agent activations.
+/// Activating and deactivating agents uses the Temporal client.
+/// Creating and deleting activations uses the database repository.
+/// </summary>
+public class ActivationService : IActivationService
+{
+    private readonly IActivationRepository _activationRepository;
+    private readonly IAgentRepository _agentRepository;
+    private readonly IFlowDefinitionRepository _flowDefinitionRepository;
+    private readonly IWorkflowStarterService _workflowStarterService;
+    private readonly IActivationCleanupService _cleanupService;
+    private readonly IActivationValidationService _activationValidationService;
+    private readonly IWebhookEventPublisher _webhookEventPublisher;
+    private readonly ILogger<ActivationService> _logger;
+
+    public ActivationService(
+        IActivationRepository activationRepository,
+        IAgentRepository agentRepository,
+        IFlowDefinitionRepository flowDefinitionRepository,
+        IWorkflowStarterService workflowStarterService,
+        IActivationCleanupService cleanupService,
+        IActivationValidationService activationValidationService,
+        IWebhookEventPublisher webhookEventPublisher,
+        ILogger<ActivationService> logger)
+    {
+        _activationRepository = activationRepository ?? throw new ArgumentNullException(nameof(activationRepository));
+        _agentRepository = agentRepository ?? throw new ArgumentNullException(nameof(agentRepository));
+        _flowDefinitionRepository = flowDefinitionRepository ?? throw new ArgumentNullException(nameof(flowDefinitionRepository));
+        _workflowStarterService = workflowStarterService ?? throw new ArgumentNullException(nameof(workflowStarterService));
+        _cleanupService = cleanupService ?? throw new ArgumentNullException(nameof(cleanupService));
+        _activationValidationService = activationValidationService ?? throw new ArgumentNullException(nameof(activationValidationService));
+        _webhookEventPublisher = webhookEventPublisher ?? throw new ArgumentNullException(nameof(webhookEventPublisher));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+    }
+
+    /// <summary>
+    /// Creates a new agent activation record in the database.
+    /// </summary>
+    public async Task<ServiceResult<AgentActivation>> CreateActivationAsync(
+        CreateActivationRequest request, 
+        string userId, 
+        string tenantId)
+    {
+        try
+        {
+            _logger.LogInformation("Creating activation {Name} for agent {AgentName} in tenant {TenantId}", 
+                LogSanitizer.Sanitize(request.Name), LogSanitizer.Sanitize(request.AgentName), LogSanitizer.Sanitize(tenantId));
+
+            if (string.IsNullOrWhiteSpace(request.Name))
+            {
+                return ServiceResult<AgentActivation>.BadRequest("Activation name is required");
+            }
+
+            if (string.IsNullOrWhiteSpace(request.AgentName))
+            {
+                return ServiceResult<AgentActivation>.BadRequest("AgentName is required");
+            }
+
+            // Verify that the agent exists
+            var agent = await _agentRepository.GetByNameInternalAsync(request.AgentName, tenantId);
+            if (agent == null)
+            {
+                _logger.LogWarning("Agent with name {AgentName} not found in tenant {TenantId}", LogSanitizer.Sanitize(request.AgentName), LogSanitizer.Sanitize(tenantId));
+                return ServiceResult<AgentActivation>.NotFound($"Agent with name '{request.AgentName}' not found in tenant");
+            }
+
+            // Defense-in-depth: GetByNameInternalAsync already scopes by tenant, but never
+            // return Forbidden for a mismatch — that would confirm the agent exists elsewhere.
+            if (!string.Equals(agent.Tenant, tenantId, StringComparison.Ordinal))
+            {
+                _logger.LogWarning(
+                    "Tenant {TenantId} attempted to create activation for agent {AgentName} belonging to tenant {OwnerTenant}",
+                    LogSanitizer.Sanitize(tenantId), LogSanitizer.Sanitize(request.AgentName), LogSanitizer.Sanitize(agent.Tenant));
+                return ServiceResult<AgentActivation>.NotFound($"Agent with name '{request.AgentName}' not found in tenant");
+            }
+
+            var activation = new AgentActivation
+            {
+                Id = ObjectId.GenerateNewId().ToString(),
+                Name = request.Name,
+                AgentName = request.AgentName,
+                Description = request.Description,
+                ParticipantId = request.ParticipantId,
+                CreatedBy = userId,
+                CreatedAt = DateTime.UtcNow,
+                TenantId = tenantId,
+                WorkflowConfiguration = request.WorkflowConfiguration
+            };
+
+            // Validate the activation
+            try
+            {
+                activation = activation.SanitizeAndValidate();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Validation failed for activation {Name}", LogSanitizer.Sanitize(request.Name));
+                return ServiceResult<AgentActivation>.BadRequest($"Validation error: {ex.Message}");
+            }
+
+            await _activationRepository.CreateAsync(activation);
+
+            _logger.LogInformation("Successfully created activation {ActivationId}", LogSanitizer.Sanitize(activation.Id));
+
+            await _webhookEventPublisher.PublishAsync(
+                WebhookEventTypes.ActivationCreated,
+                new { tenantId, activationId = activation.Id, name = activation.Name, agentName = request.AgentName },
+                tenantId);
+
+            return ServiceResult<AgentActivation>.Success(activation);
+        }
+        catch (MongoWriteException ex) when (ex.WriteError?.Code == 11000)
+        {
+            // Duplicate key error - activation with same name, agent, and participant already exists
+            _logger.LogWarning(ex, "Duplicate activation detected for Name={Name}, AgentName={AgentName}, ParticipantId={ParticipantId}, TenantId={TenantId}", 
+                LogSanitizer.Sanitize(request.Name), LogSanitizer.Sanitize(request.AgentName), LogSanitizer.Sanitize(request.ParticipantId), LogSanitizer.Sanitize(tenantId));
+            
+            return ServiceResult<AgentActivation>.Conflict(
+                $"An activation with the name '{request.Name}' already exists for agent '{request.AgentName}' and participant '{request.ParticipantId}'. Please use a different name or delete the existing activation first.");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error creating activation {Name}", LogSanitizer.Sanitize(request.Name));
+            return ServiceResult<AgentActivation>.InternalServerError(
+                "An error occurred while creating the activation");
+        }
+    }
+
+    /// <summary>
+    /// Updates an existing agent activation.
+    /// Note: Cannot update AgentName. If the activation is already activated, deactivate it first.
+    /// </summary>
+    public async Task<ServiceResult<AgentActivation>> UpdateActivationAsync(
+        string activationId,
+        UpdateActivationRequest request,
+        string tenantId)
+    {
+        try
+        {
+            _logger.LogInformation("Updating activation {ActivationId}", LogSanitizer.Sanitize(activationId));
+
+            if (string.IsNullOrWhiteSpace(activationId))
+            {
+                return ServiceResult<AgentActivation>.BadRequest("Activation ID is required");
+            }
+
+            var activation = await _activationRepository.GetByIdAsync(activationId);
+            if (activation == null)
+            {
+                _logger.LogWarning("Activation with ID {ActivationId} not found", LogSanitizer.Sanitize(activationId));
+                return ServiceResult<AgentActivation>.NotFound($"Activation with ID '{activationId}' not found");
+            }
+
+            if (!string.Equals(activation.TenantId, tenantId, StringComparison.Ordinal))
+            {
+                _logger.LogWarning(
+                    "Tenant {TenantId} attempted to update activation {ActivationId} belonging to tenant {OwnerTenant}",
+                    LogSanitizer.Sanitize(tenantId), LogSanitizer.Sanitize(activationId), LogSanitizer.Sanitize(activation.TenantId));
+                return ServiceResult<AgentActivation>.NotFound($"Activation with ID '{activationId}' not found");
+            }
+
+            // Check if activation is currently active (has running workflows)
+            var hasRunningWorkflows = activation.WorkflowIds.Count > 0;
+            
+            // Determine which fields are being updated
+            var isUpdatingName = !string.IsNullOrWhiteSpace(request.Name);
+            var isUpdatingDescription = request.Description != null;
+            var isUpdatingParticipantId = request.ParticipantId != null;
+            var isUpdatingWorkflowConfiguration = request.WorkflowConfiguration != null;
+
+            // Only allow description updates when workflows are running
+            if (hasRunningWorkflows)
+            {
+                var isOnlyDescriptionUpdate = isUpdatingDescription && 
+                    !isUpdatingName && 
+                    !isUpdatingParticipantId && 
+                    !isUpdatingWorkflowConfiguration;
+
+                if (!isOnlyDescriptionUpdate)
+                {
+                    _logger.LogWarning(
+                        "Attempting to update active activation {ActivationId} with {Count} workflows running. " +
+                        "Only description updates are allowed for active activations.",
+                        LogSanitizer.Sanitize(activationId), activation.WorkflowIds!.Count);
+                    return ServiceResult<AgentActivation>.Conflict(
+                        "Cannot update name, participantId, or workflowConfiguration on an activation with running workflows. " +
+                        "Only description can be updated. Please deactivate it first to update other fields.");
+                }
+
+                _logger.LogInformation(
+                    "Allowing description-only update for active activation {ActivationId} with {Count} running workflows",
+                    LogSanitizer.Sanitize(activationId), activation.WorkflowIds!.Count);
+            }
+
+            // Capture the previous name so a rename can invalidate the old cache entry.
+            var previousName = activation.Name;
+
+            // Update only the fields that are provided
+            if (isUpdatingName)
+            {
+                activation.Name = request.Name!;
+            }
+
+            if (isUpdatingDescription)
+            {
+                activation.Description = request.Description;
+            }
+
+            if (isUpdatingParticipantId)
+            {
+                activation.ParticipantId = request.ParticipantId;
+            }
+
+            if (isUpdatingWorkflowConfiguration)
+            {
+                // Validate the workflow configuration
+                try
+                {
+                    request.WorkflowConfiguration!.Validate();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Invalid workflow configuration provided for activation {ActivationId}", LogSanitizer.Sanitize(activationId));
+                    return ServiceResult<AgentActivation>.BadRequest($"Invalid workflow configuration: {ex.Message}");
+                }
+
+                activation.WorkflowConfiguration = request.WorkflowConfiguration;
+            }
+
+            // Validate the updated activation
+            try
+            {
+                activation = activation.SanitizeAndValidate();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Validation failed for activation {ActivationId}", LogSanitizer.Sanitize(activationId));
+                return ServiceResult<AgentActivation>.BadRequest($"Validation error: {ex.Message}");
+            }
+
+            await _activationRepository.UpdateAsync(activationId, activation);
+
+            // Invalidate validation cache for the (possibly new) name, and the old name on rename.
+            _activationValidationService.InvalidateActivationCache(activation.TenantId, activation.AgentName, activation.Name);
+            if (isUpdatingName && !string.Equals(previousName, activation.Name, StringComparison.Ordinal))
+            {
+                _activationValidationService.InvalidateActivationCache(activation.TenantId, activation.AgentName, previousName);
+            }
+
+            _logger.LogInformation("Successfully updated activation {ActivationId}", LogSanitizer.Sanitize(activationId));
+
+            await _webhookEventPublisher.PublishAsync(
+                WebhookEventTypes.ActivationUpdated,
+                new { tenantId, activationId = activation.Id, name = activation.Name },
+                tenantId);
+
+            return ServiceResult<AgentActivation>.Success(activation);
+        }
+        catch (MongoDB.Driver.MongoWriteException ex) when (ex.WriteError?.Code == 11000)
+        {
+            _logger.LogWarning(ex, "Duplicate activation detected when updating {ActivationId}", LogSanitizer.Sanitize(activationId));
+            return ServiceResult<AgentActivation>.Conflict(
+                "An activation with this name already exists for the same agent and participant. Please use a different name.");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error updating activation {ActivationId}", LogSanitizer.Sanitize(activationId));
+            return ServiceResult<AgentActivation>.InternalServerError(
+                "An error occurred while updating the activation");
+        }
+    }
+
+    /// <summary>
+    /// Gets an activation by its ID.
+    /// </summary>
+    public async Task<ServiceResult<AgentActivation>> GetActivationByIdAsync(string id)
+    {
+        try
+        {
+            _logger.LogInformation("Retrieving activation by ID {ActivationId}", LogSanitizer.Sanitize(id));
+
+            if (string.IsNullOrWhiteSpace(id))
+            {
+                return ServiceResult<AgentActivation>.BadRequest("Activation ID is required");
+            }
+
+            var activation = await _activationRepository.GetByIdAsync(id);
+            if (activation == null)
+            {
+                _logger.LogWarning("Activation with ID {ActivationId} not found", LogSanitizer.Sanitize(id));
+                return ServiceResult<AgentActivation>.NotFound($"Activation with ID '{id}' not found");
+            }
+
+            return ServiceResult<AgentActivation>.Success(activation);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error retrieving activation by ID {ActivationId}", LogSanitizer.Sanitize(id));
+            return ServiceResult<AgentActivation>.InternalServerError(
+                "An error occurred while retrieving the activation");
+        }
+    }
+
+    /// <summary>
+    /// Gets all activations for a tenant, optionally filtered by agent name.
+    /// </summary>
+    public async Task<ServiceResult<List<AgentActivation>>> GetActivationsByTenantAsync(string tenantId, string? agentName = null)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(agentName))
+            {
+                _logger.LogInformation("Retrieving all activations for tenant {TenantId}", LogSanitizer.Sanitize(tenantId));
+                var activations = await _activationRepository.GetByTenantIdAsync(tenantId);
+                _logger.LogInformation("Found {Count} activations for tenant {TenantId}", activations.Count, LogSanitizer.Sanitize(tenantId));
+                return ServiceResult<List<AgentActivation>>.Success(activations);
+            }
+            else
+            {
+                _logger.LogInformation("Retrieving activations for tenant {TenantId} filtered by agent name {AgentName}", LogSanitizer.Sanitize(tenantId), LogSanitizer.Sanitize(agentName));
+                var activations = await _activationRepository.GetByAgentNameAsync(agentName, tenantId);
+                _logger.LogInformation("Found {Count} activations for tenant {TenantId} with agent name {AgentName}", activations.Count, LogSanitizer.Sanitize(tenantId), LogSanitizer.Sanitize(agentName));
+                return ServiceResult<List<AgentActivation>>.Success(activations);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error retrieving activations for tenant {TenantId}", LogSanitizer.Sanitize(tenantId));
+            return ServiceResult<List<AgentActivation>>.InternalServerError(
+                "An error occurred while retrieving activations");
+        }
+    }
+
+    /// <summary>
+    /// Activates an agent by starting a workflow in Temporal.
+    /// </summary>
+    public async Task<ServiceResult<AgentActivation>> ActivateAgentAsync(
+        string activationId, 
+        string tenantId,
+        ActivationWorkflowConfiguration? workflowConfiguration = null)
+    {
+        try
+        {
+            _logger.LogInformation("Activating agent for activation {ActivationId}", LogSanitizer.Sanitize(activationId));
+
+            var activation = await _activationRepository.GetByIdAsync(activationId);
+            if (activation == null)
+            {
+                _logger.LogWarning("Activation with ID {ActivationId} not found", LogSanitizer.Sanitize(activationId));
+                return ServiceResult<AgentActivation>.NotFound($"Activation with ID '{activationId}' not found");
+            }
+
+            if (!string.Equals(activation.TenantId, tenantId, StringComparison.Ordinal))
+            {
+                _logger.LogWarning(
+                    "Tenant {TenantId} attempted to activate activation {ActivationId} belonging to tenant {OwnerTenant}",
+                    LogSanitizer.Sanitize(tenantId), LogSanitizer.Sanitize(activationId), LogSanitizer.Sanitize(activation.TenantId));
+                return ServiceResult<AgentActivation>.NotFound($"Activation with ID '{activationId}' not found");
+            }
+
+            // If workflow configuration is provided in the request, update the activation with it
+            if (workflowConfiguration != null)
+            {
+                _logger.LogInformation("Updating activation {ActivationId} with workflow configuration from request", LogSanitizer.Sanitize(activationId));
+                
+                // Validate the workflow configuration
+                try
+                {
+                    workflowConfiguration.Validate();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Invalid workflow configuration provided for activation {ActivationId}", LogSanitizer.Sanitize(activationId));
+                    return ServiceResult<AgentActivation>.BadRequest($"Invalid workflow configuration: {ex.Message}");
+                }
+
+                // Update the activation with the new workflow configuration
+                activation.WorkflowConfiguration = workflowConfiguration;
+                await _activationRepository.UpdateAsync(activationId, activation);
+                
+                _logger.LogInformation("Successfully updated workflow configuration for activation {ActivationId}", LogSanitizer.Sanitize(activationId));
+            }
+
+            // Get the agent details
+            var agent = await _agentRepository.GetByNameInternalAsync(activation.AgentName, tenantId);
+            if (agent == null)
+            {
+                _logger.LogWarning("Agent with name {AgentName} not found in tenant {TenantId}", LogSanitizer.Sanitize(activation.AgentName), LogSanitizer.Sanitize(tenantId));
+                return ServiceResult<AgentActivation>.NotFound($"Agent with name '{activation.AgentName}' not found in tenant");
+            }
+
+            // Get all flow definitions (workflows) for the agent
+            var systemScoped = agent.SystemScoped;
+            var flowDefinitions = await _flowDefinitionRepository.GetByNameAsync(
+                activation.AgentName, 
+                systemScoped ? null : tenantId);
+
+            if (flowDefinitions == null || flowDefinitions.Count == 0)
+            {
+                _logger.LogWarning("No workflow definitions found for agent {AgentName}", LogSanitizer.Sanitize(activation.AgentName));
+                return ServiceResult<AgentActivation>.BadRequest($"No workflow definitions found for agent '{activation.AgentName}'");
+            }
+
+            _logger.LogInformation("Found {Count} workflow definitions for agent {AgentName}", 
+                flowDefinitions.Count, LogSanitizer.Sanitize(activation.AgentName));
+
+            // Start all workflows using WorkflowStarterService
+            try
+            {
+                var workflowIds = new List<string>();
+                var startedCount = 0;
+
+                foreach (var flowDefinition in flowDefinitions)
+                {
+                    try
+                    {
+                        if (!flowDefinition.Activable)
+                        {
+                            _logger.LogWarning("Workflow {WorkflowType} is not activable", LogSanitizer.Sanitize(flowDefinition.WorkflowType));
+                            continue;
+                        }
+
+                        // Find matching workflow configuration for this workflow type
+                        var workflowConfig = activation.WorkflowConfiguration?.Workflows
+                            .FirstOrDefault(w => w.WorkflowType == flowDefinition.WorkflowType);
+
+                        // Convert workflow inputs to string parameters array
+                        string[] parameters;
+
+                        if (workflowConfig != null)
+                        {
+                            // Use inputs from configuration
+                            parameters = workflowConfig.Inputs
+                                .Select(input => input.Value)
+                                .ToArray();
+                        }
+                        else
+                        {
+                            // No configuration provided, use empty parameters
+                            parameters = Array.Empty<string>();
+                        }
+
+                        // Always use activation name as the workflow ID postfix
+                        var workflowIdPostfix = $"{activation.Name}";
+
+                        // Create workflow request
+                        var workflowRequest = new WorkflowRequest
+                        {
+                            WorkflowType = flowDefinition.WorkflowType,
+                            WorkflowIdPostfix = workflowIdPostfix,
+                            Parameters = parameters,
+                            AgentName = activation.AgentName
+                        };
+
+                        // Start workflow using WorkflowStarterService
+                        var result = await _workflowStarterService.HandleStartWorkflow(workflowRequest, activation.ParticipantId);
+
+                        if (result.IsSuccess && result.Data != null)
+                        {
+                            workflowIds.Add(result.Data.WorkflowId);
+                            startedCount++;
+                            
+                            _logger.LogInformation("Started workflow {WorkflowType} with ID {WorkflowId} for activation {ActivationId}", 
+                                LogSanitizer.Sanitize(flowDefinition.WorkflowType), LogSanitizer.Sanitize(result.Data.WorkflowId), LogSanitizer.Sanitize(activationId));
+                        }
+                        else
+                        {
+                            _logger.LogWarning("Failed to start workflow {WorkflowType} for activation {ActivationId}: {Error}", 
+                                LogSanitizer.Sanitize(flowDefinition.WorkflowType), LogSanitizer.Sanitize(activationId), LogSanitizer.Sanitize(result.ErrorMessage));
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Error starting workflow {WorkflowType} for activation {ActivationId}", 
+                            LogSanitizer.Sanitize(flowDefinition.WorkflowType), LogSanitizer.Sanitize(activationId));
+                        // stop here and return the error
+                        return ServiceResult<AgentActivation>.InternalServerError(
+                            $"Failed to start workflow {flowDefinition.WorkflowType} for activation {activationId}: {ex.Message}");
+                    }
+                }
+
+                if (workflowIds.Count == 0)
+                {
+                    _logger.LogWarning("No workflows were started for activation {ActivationId} (none activable or all failed). Activating with empty workflow list.", LogSanitizer.Sanitize(activationId));
+                }
+
+                // Update activation with workflow IDs and timestamp
+                activation.WorkflowIds = workflowIds;
+                activation.Active = true;
+                activation.ActivatedAt = DateTime.UtcNow;
+                activation.DeactivatedAt = null; // Clear on re-activation
+
+                await _activationRepository.UpdateAsync(activationId, activation);
+
+                _activationValidationService.InvalidateActivationCache(activation.TenantId, activation.AgentName, activation.Name);
+
+                _logger.LogInformation("Successfully activated {StartedCount}/{TotalCount} workflows for activation {ActivationId}", 
+                    startedCount, flowDefinitions.Count, LogSanitizer.Sanitize(activationId));
+
+                await _webhookEventPublisher.PublishAsync(
+                    WebhookEventTypes.ActivationActivated,
+                    new { tenantId, activationId = activation.Id, name = activation.Name, agentName = activation.AgentName, workflowIds = activation.WorkflowIds },
+                    tenantId);
+
+                return ServiceResult<AgentActivation>.Success(activation);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error starting workflows for activation {ActivationId}", LogSanitizer.Sanitize(activationId));
+                return ServiceResult<AgentActivation>.InternalServerError(
+                    $"Failed to start workflows: {ex.Message}");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error activating agent for activation {ActivationId}", LogSanitizer.Sanitize(activationId));
+            return ServiceResult<AgentActivation>.InternalServerError(
+                "An error occurred while activating the agent");
+        }
+    }
+
+    /// <summary>
+    /// Deactivates an agent by canceling/terminating workflows and deleting schedules in Temporal.
+    /// This method now performs a comprehensive cleanup of all resources associated with the activation:
+    /// - Finds all workflows matching the activation (by tenantId, agent, and idPostfix)
+    /// - Cancels/stops all running workflows
+    /// - Finds all schedules matching the activation
+    /// - Deletes all schedules
+    /// </summary>
+    public async Task<ServiceResult<AgentActivation>> DeactivateAgentAsync(
+        string activationId, 
+        string tenantId)
+    {
+        try
+        {
+            _logger.LogInformation("Deactivating agent for activation {ActivationId}", LogSanitizer.Sanitize(activationId));
+
+            var activation = await _activationRepository.GetByIdAsync(activationId);
+            if (activation == null)
+            {
+                _logger.LogWarning("Activation with ID {ActivationId} not found", LogSanitizer.Sanitize(activationId));
+                return ServiceResult<AgentActivation>.NotFound($"Activation with ID '{activationId}' not found");
+            }
+
+            if (!string.Equals(activation.TenantId, tenantId, StringComparison.Ordinal))
+            {
+                _logger.LogWarning(
+                    "Tenant {TenantId} attempted to deactivate activation {ActivationId} belonging to tenant {OwnerTenant}",
+                    LogSanitizer.Sanitize(tenantId), LogSanitizer.Sanitize(activationId), LogSanitizer.Sanitize(activation.TenantId));
+                return ServiceResult<AgentActivation>.NotFound($"Activation with ID '{activationId}' not found");
+            }
+
+            // Perform comprehensive cleanup of all workflows and schedules associated with this activation
+            _logger.LogInformation(
+                "Starting comprehensive cleanup for activation {ActivationId} (Name: {Name}, Agent: {Agent})",
+                LogSanitizer.Sanitize(activationId), LogSanitizer.Sanitize(activation.Name), LogSanitizer.Sanitize(activation.AgentName));
+
+            var cleanupResult = await _cleanupService.CleanupActivationResourcesAsync(activation);
+
+            if (!cleanupResult.IsSuccess || cleanupResult.Data == null)
+            {
+                _logger.LogError(
+                    "Failed to cleanup resources for activation {ActivationId}: {Error}",
+                    LogSanitizer.Sanitize(activationId), LogSanitizer.Sanitize(cleanupResult.ErrorMessage));
+                return ServiceResult<AgentActivation>.InternalServerError(
+                    $"Failed to cleanup activation resources: {cleanupResult.ErrorMessage}");
+            }
+
+            var cleanup = cleanupResult.Data;
+
+            // Log cleanup results
+            _logger.LogInformation(
+                "Cleanup completed for activation {ActivationId}. " +
+                "Workflows: {CancelledWorkflows}/{TotalWorkflows} cancelled ({FailedWorkflows} failed), " +
+                "Schedules: {DeletedSchedules}/{TotalSchedules} deleted ({FailedSchedules} failed)",
+                LogSanitizer.Sanitize(activationId),
+                cleanup.WorkflowCleanup.CancelledCount,
+                cleanup.WorkflowCleanup.TotalWorkflows,
+                cleanup.WorkflowCleanup.FailedCount,
+                cleanup.ScheduleCleanup.DeletedCount,
+                cleanup.ScheduleCleanup.TotalSchedules,
+                cleanup.ScheduleCleanup.FailedCount);
+
+            // Check if there were any failures during cleanup
+            if (!cleanup.Success)
+            {
+                _logger.LogWarning(
+                    "Activation {ActivationId} cleanup had failures. " +
+                    "Failed workflows: {FailedWorkflows}, Failed schedules: {FailedSchedules}",
+                    LogSanitizer.Sanitize(activationId),
+                    cleanup.WorkflowCleanup.FailedCount,
+                    cleanup.ScheduleCleanup.FailedCount);
+                
+                // Even with some failures, we'll proceed to update the activation status
+                // The user should be informed that some resources may still exist
+            }
+
+            // Clear workflow IDs and update timestamp
+            activation.WorkflowIds = new List<string>();
+            activation.Active = false;
+            activation.DeactivatedAt = DateTime.UtcNow;
+
+            await _activationRepository.UpdateAsync(activationId, activation);
+
+            _activationValidationService.InvalidateActivationCache(activation.TenantId, activation.AgentName, activation.Name);
+
+            _logger.LogInformation(
+                "Successfully deactivated activation {ActivationId}. " +
+                "Total resources cleaned: {TotalWorkflows} workflows, {TotalSchedules} schedules",
+                LogSanitizer.Sanitize(activationId),
+                cleanup.WorkflowCleanup.TotalWorkflows,
+                cleanup.ScheduleCleanup.TotalSchedules);
+
+            await _webhookEventPublisher.PublishAsync(
+                WebhookEventTypes.ActivationDeactivated,
+                new { tenantId = activation.TenantId, activationId = activation.Id, name = activation.Name, agentName = activation.AgentName },
+                activation.TenantId);
+
+            return ServiceResult<AgentActivation>.Success(activation);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error deactivating agent for activation {ActivationId}", LogSanitizer.Sanitize(activationId));
+            return ServiceResult<AgentActivation>.InternalServerError(
+                "An error occurred while deactivating the agent");
+        }
+    }
+
+    /// <summary>
+    /// Deletes an activation from the database.
+    /// Note: This will not cancel any running workflows. Deactivate first if needed.
+    /// </summary>
+    public async Task<ServiceResult<bool>> DeleteActivationAsync(string activationId)
+    {
+        try
+        {
+            _logger.LogInformation("Deleting activation {ActivationId}", LogSanitizer.Sanitize(activationId));
+
+            if (string.IsNullOrWhiteSpace(activationId))
+            {
+                return ServiceResult<bool>.BadRequest("Activation ID is required");
+            }
+
+            var activation = await _activationRepository.GetByIdAsync(activationId);
+            if (activation == null)
+            {
+                _logger.LogWarning("Activation with ID {ActivationId} not found", LogSanitizer.Sanitize(activationId));
+                return ServiceResult<bool>.NotFound($"Activation with ID '{activationId}' not found");
+            }
+
+            // Warn if trying to delete an activation with workflows (has workflows)
+            if (activation.WorkflowIds != null && activation.WorkflowIds.Count > 0)
+            {
+                _logger.LogWarning("Attempting to delete activation {ActivationId} with {Count} workflows running.", 
+                    LogSanitizer.Sanitize(activationId), activation.WorkflowIds.Count);
+                return ServiceResult<bool>.Conflict("Cannot delete an activation with running workflows. Please deactivate it first.");
+            }
+
+            var deleted = await _activationRepository.DeleteAsync(activationId);
+            if (!deleted)
+            {
+                _logger.LogWarning("Failed to delete activation {ActivationId}", LogSanitizer.Sanitize(activationId));
+                return ServiceResult<bool>.InternalServerError("Failed to delete the activation");
+            }
+
+            _activationValidationService.InvalidateActivationCache(activation.TenantId, activation.AgentName, activation.Name);
+
+            _logger.LogInformation("Successfully deleted activation {ActivationId}", LogSanitizer.Sanitize(activationId));
+
+            await _webhookEventPublisher.PublishAsync(
+                WebhookEventTypes.ActivationDeleted,
+                new { tenantId = activation.TenantId, activationId = activation.Id, name = activation.Name, agentName = activation.AgentName },
+                activation.TenantId);
+
+            return ServiceResult<bool>.Success(true);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error deleting activation {ActivationId}", LogSanitizer.Sanitize(activationId));
+            return ServiceResult<bool>.InternalServerError(
+                "An error occurred while deleting the activation");
+        }
+    }
+}

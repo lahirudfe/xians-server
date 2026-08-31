@@ -1,0 +1,45 @@
+using System.Net;
+using System.Net.Http.Json;
+using Tests.TestUtils;
+using Shared.Services;
+
+namespace Tests.IntegrationTests.WebApi;
+
+public class TenantEndpointsTests : WebApiIntegrationTestBase
+{
+    public TenantEndpointsTests(MongoDbFixture mongoFixture) : base(mongoFixture)
+    {
+    }
+
+    [Fact]
+    public async Task GetAllTenants_ReturnsListOfTenants()
+    {
+        // Act
+        var response = await GetAsync("/api/client/tenants/");
+
+        // Assert
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var tenants = await response.Content.ReadFromJsonAsync<List<object>>();
+        Assert.NotNull(tenants);
+    }
+
+    [Fact]
+    public async Task CreateTenant_WithInvalidData_ReturnsBadRequest()
+    {
+        // Arrange
+        var request = new CreateTenantRequest
+        {
+            TenantId = "", // Invalid: empty tenant ID
+            Name = "Test Tenant Invalid",
+            Domain = "invalid.example.com",
+            Description = "Test tenant with invalid data",
+            Timezone = "UTC"
+        };
+
+        // Act
+        var response = await PostAsJsonAsync("/api/client/tenants/", request);
+
+        // Assert - invalid data (empty TenantId) must be rejected
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+}

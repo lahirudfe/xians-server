@@ -1,0 +1,161 @@
+### Variables
+@baseUrl = http://localhost:5005
+@apiVersion = v1
+@tenantId = new-tenant-33
+
+# API Key Authentication
+# Replace with your actual API key (must start with "sk-Xnai-")
+# The API key must belong to a user with SysAdmin role
+@apiKey = {{$processEnv ADMIN_API_KEY}}
+
+# Note: Replace these with actual values from your database
+# templateObjectId: MongoDB ObjectId from list templates response (e.g., "6959f2ffb50bd67dcb893911")
+# Use this for GET/PUT/DELETE operations
+@templateObjectId = 6967481c55229f26307c7050
+
+### ============================================
+### API Key Authentication
+### ============================================
+# AdminApi uses API key authentication via:
+# 1. Authorization header (preferred): Authorization: Bearer <api-key>
+# (Query parameter ?apikey= is not supported - use Authorization header only)
+#
+# The API key must belong to a user with SysAdmin role.
+# Tenant ID can be provided via:
+# - Query parameter: ?tenantId=<tenant-id>
+# - Route parameter: /tenants/{tenantId}/...
+# - X-Tenant-Id header: X-Tenant-Id: <tenant-id>
+
+### ============================================
+### Agent Template Management
+### ============================================
+
+### System-Level Operations (SysAdmin only, NO X-Tenant-Id required)
+### ============================================
+
+### List All Agent Templates (System Admin)
+# Browse all available agent templates (SystemScoped agents)
+# System admin only - NO X-Tenant-Id header required
+# Optional query parameter: basicDataOnly (boolean, default: false)
+GET {{baseUrl}}/api/{{apiVersion}}/admin/agentTemplates?basicDataOnly=false
+Authorization: Bearer {{apiKey}}
+Accept: application/json
+
+###
+
+### Get Agent Template Details (System Admin)
+# Get detailed information about a specific template
+# System admin only - NO X-Tenant-Id header required
+# Note: Uses MongoDB ObjectId (not template name) - get from list templates response
+GET {{baseUrl}}/api/{{apiVersion}}/admin/agentTemplates/{{templateObjectId}}
+Authorization: Bearer {{apiKey}}
+Accept: application/json
+
+###
+
+### Update Agent Template (System Admin)
+# Update an existing agent template (description, onboardingJson, permissions)
+# System admin only - NO X-Tenant-Id header required
+# Note: Uses MongoDB ObjectId (not template name) - get from list templates response
+PATCH {{baseUrl}}/api/{{apiVersion}}/admin/agentTemplates/{{templateObjectId}}
+Authorization: Bearer {{apiKey}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "description": "Customer support agent template",
+  "onboardingJson": "{\"description\":\"Customer support agent\"}",
+  "ownerAccess": ["github|195087421"],
+  "readAccess": ["github|195087421"],
+  "writeAccess": []
+}
+
+###
+
+### Delete Agent Template (System Admin)
+# Delete an agent template
+# System admin only - NO X-Tenant-Id header required
+# Note: Uses MongoDB ObjectId (not template name) - get from list templates response
+DELETE {{baseUrl}}/api/{{apiVersion}}/admin/agentTemplates/{{templateObjectId}}
+Authorization: Bearer {{apiKey}}
+Accept: application/json
+
+###
+
+### List Template Deployments (System Admin)
+# List which tenants have a deployed instance of a system template
+# System admin only - NO X-Tenant-Id header required
+# Note: Uses MongoDB ObjectId - get from list templates response
+GET {{baseUrl}}/api/{{apiVersion}}/admin/agentTemplates/{{templateObjectId}}/deployments
+Authorization: Bearer {{apiKey}}
+Accept: application/json
+
+###
+
+### Tenant-Scoped Operations (X-Tenant-Id required)
+### ============================================
+# Note: Browsing tenant-scoped agents (deployments) is handled by the
+# Agent Deployment endpoints (/api/v1/admin/tenants/{tenantId}/agentDeployments),
+# not by the template endpoints. Templates themselves are system-scoped (global).
+
+### Deploy Agent Template to Tenant
+# Deploy an agent template to a specific tenant
+# This creates a new agent instance in the tenant
+# Tenant ID can be provided via query parameter, route parameter, or X-Tenant-Id header
+# Note: Uses MongoDB ObjectId - get from list templates response
+POST {{baseUrl}}/api/{{apiVersion}}/admin/agentTemplates/{{templateObjectId}}/deploy?tenantId={{tenantId}}
+Authorization: Bearer {{apiKey}}
+X-Tenant-Id: {{tenantId}}
+Accept: application/json
+
+###
+
+### ============================================
+### Name-Based Operations (templates are uniquely identified by agent name)
+### ============================================
+# These are equivalents of the ObjectId-based endpoints above, addressing the
+# template by its agent name under the /by-name/ segment.
+@templateAgentName = support-agent
+
+### Get Agent Template Details by Name (System Admin)
+GET {{baseUrl}}/api/{{apiVersion}}/admin/agentTemplates/by-name/{{templateAgentName}}
+Authorization: Bearer {{apiKey}}
+Accept: application/json
+
+###
+
+### Update Agent Template by Name (System Admin)
+PATCH {{baseUrl}}/api/{{apiVersion}}/admin/agentTemplates/by-name/{{templateAgentName}}
+Authorization: Bearer {{apiKey}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "description": "Customer support agent template",
+  "samplePrompts": ["Help a customer with their order status"]
+}
+
+###
+
+### Delete Agent Template by Name (System Admin)
+DELETE {{baseUrl}}/api/{{apiVersion}}/admin/agentTemplates/by-name/{{templateAgentName}}
+Authorization: Bearer {{apiKey}}
+Accept: application/json
+
+###
+
+### List Template Deployments by Name (System Admin)
+GET {{baseUrl}}/api/{{apiVersion}}/admin/agentTemplates/by-name/{{templateAgentName}}/deployments
+Authorization: Bearer {{apiKey}}
+Accept: application/json
+
+###
+
+### Deploy Agent Template to Tenant by Name
+POST {{baseUrl}}/api/{{apiVersion}}/admin/agentTemplates/by-name/{{templateAgentName}}/deploy?tenantId={{tenantId}}
+Authorization: Bearer {{apiKey}}
+X-Tenant-Id: {{tenantId}}
+Accept: application/json
+
+###
+

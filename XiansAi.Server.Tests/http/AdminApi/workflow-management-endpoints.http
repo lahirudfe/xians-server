@@ -1,0 +1,175 @@
+### Variables
+@baseUrl = http://localhost:5005
+@apiVersion = v1
+@tenantId = default
+
+# API Key Authentication
+# Replace with your actual API key (must start with "sk-Xnai-")
+# The API key must belong to a user with SysAdmin role
+@apiKey = {{$processEnv ADMIN_API_KEY}}
+
+# agentName: Agent name (e.g., "my-agent")
+@agentName = My Conversational Agent
+# workflowId: Workflow ID (e.g., "workflow-123")
+@workflowId = workflow-123
+# runId: Optional workflow run ID
+@runId = 
+
+### ============================================
+### API Key Authentication
+### ============================================
+# AdminApi uses API key authentication via:
+# 1. Authorization header (preferred): Authorization: Bearer <api-key>
+# (Query parameter ?apikey= is not supported - use Authorization header only)
+#
+# The API key must belong to a user with SysAdmin role.
+# Tenant ID can be provided via:
+# - Query parameter: ?tenantId=<tenant-id>
+# - Route parameter: /tenants/{tenantId}/...
+# - X-Tenant-Id header: X-Tenant-Id: <tenant-id>
+
+### ============================================
+### Workflow Management (X-Tenant-Id required)
+### ============================================
+
+### Activate Workflow (Start/Create New Workflow) - All Parameters
+# Activate (start) a new workflow for a specific tenant with all parameters
+# Tenant ID can be provided via route parameter (in URL) or X-Tenant-Id header
+# Optional userId query parameter to override the default user ID from authentication context
+POST {{baseUrl}}/api/{{apiVersion}}/admin/tenants/{{tenantId}}/workflows/activate?userId=admin-user-123
+Authorization: Bearer {{apiKey}}
+X-Tenant-Id: {{tenantId}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "workflowType": "MyWorkflowType",
+  "agentName": "{{agentName}}",
+  "workflowIdPostfix": "custom-id",
+  "parameters": ["param1", "param2", "param3"],
+  "assignment": "assignment-name"
+}
+
+###
+
+### Activate Workflow - Only Required Parameters
+# Example: Workflow definition has both required and optional parameters
+# This request only provides required parameters (optional ones are omitted)
+# Parameters: url (required), mode (optional), verbose (optional)
+POST {{baseUrl}}/api/{{apiVersion}}/admin/tenants/{{tenantId}}/workflows/activate
+Authorization: Bearer {{apiKey}}
+X-Tenant-Id: {{tenantId}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "workflowType": "MyWorkflowType",
+  "agentName": "{{agentName}}",
+  "parameters": ["https://example.com"]
+}
+
+###
+
+### Activate Workflow - Partial Optional Parameters
+# Example: Providing required + some optional parameters
+# Parameters: url (required), mode (optional) - both provided
+POST {{baseUrl}}/api/{{apiVersion}}/admin/tenants/{{tenantId}}/workflows/activate
+Authorization: Bearer {{apiKey}}
+X-Tenant-Id: {{tenantId}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "workflowType": "MyWorkflowType",
+  "agentName": "{{agentName}}",
+  "workflowIdPostfix": "custom-id",
+  "parameters": ["https://example.com", "detailed"],
+  "assignment": "assignment-name"
+}
+
+###
+
+### Activate Workflow - Empty String for Optional Parameter
+# Example: Empty string for optional parameter (will be treated as null)
+# Parameters: url (required), mode (optional - empty string), count (optional)
+POST {{baseUrl}}/api/{{apiVersion}}/admin/tenants/{{tenantId}}/workflows/activate?userId=admin-user-123
+Authorization: Bearer {{apiKey}}
+X-Tenant-Id: {{tenantId}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "workflowType": "MyWorkflowType",
+  "agentName": "{{agentName}}",
+  "parameters": ["https://example.com", "", "5"]
+}
+
+###
+
+### Get Workflow by ID
+# Get detailed information about a specific workflow
+# Tenant ID can be provided via route parameter (in URL) or X-Tenant-Id header
+# Note: Pass workflowId and optional runId as query parameters
+GET {{baseUrl}}/api/{{apiVersion}}/admin/tenants/{{tenantId}}/workflows?workflowId={{workflowId}}&runId={{runId}}
+Authorization: Bearer {{apiKey}}
+X-Tenant-Id: {{tenantId}}
+Accept: application/json
+
+###
+
+### List Workflows
+# Get all workflows with optional filtering and pagination
+# Tenant ID can be provided via route parameter (in URL) or X-Tenant-Id header
+# Optional query parameters: status, agent, workflowType, user, pageSize, pageToken
+GET {{baseUrl}}/api/{{apiVersion}}/admin/tenants/{{tenantId}}/workflows/list?status=RUNNING&agent={{agentName}}&pageSize=10
+Authorization: Bearer {{apiKey}}
+X-Tenant-Id: {{tenantId}}
+Accept: application/json
+
+###
+
+### Get Workflow Events
+# Get event history for a specific workflow
+# Tenant ID can be provided via route parameter (in URL) or X-Tenant-Id header
+# Note: Pass workflowId as query parameter
+GET {{baseUrl}}/api/{{apiVersion}}/admin/tenants/{{tenantId}}/workflows/events?workflowId={{workflowId}}
+Authorization: Bearer {{apiKey}}
+X-Tenant-Id: {{tenantId}}
+Accept: application/json
+
+###
+
+### Stream Workflow Events
+# Stream workflow events in real-time using Server-Sent Events (SSE)
+# Tenant ID can be provided via route parameter (in URL) or X-Tenant-Id header
+# Note: Pass workflowId as query parameter
+# Note: In REST Client, SSE streams may not display properly. Use a dedicated SSE client or browser for testing.
+GET {{baseUrl}}/api/{{apiVersion}}/admin/tenants/{{tenantId}}/workflows/events/stream?workflowId={{workflowId}}
+Authorization: Bearer {{apiKey}}
+X-Tenant-Id: {{tenantId}}
+Accept: text/event-stream
+
+###
+
+### Get Workflow Types
+# Get all unique workflow types for a specific agent
+# Tenant ID can be provided via route parameter (in URL) or X-Tenant-Id header
+# Note: Pass agent name as query parameter
+GET {{baseUrl}}/api/{{apiVersion}}/admin/tenants/{{tenantId}}/workflows/types?agent={{agentName}}
+Authorization: Bearer {{apiKey}}
+X-Tenant-Id: {{tenantId}}
+Accept: application/json
+
+###
+
+### Cancel Workflow
+# Cancel a running workflow
+# Tenant ID can be provided via route parameter (in URL) or X-Tenant-Id header
+# Note: Pass workflowId and force (boolean) as query parameters
+POST {{baseUrl}}/api/{{apiVersion}}/admin/tenants/{{tenantId}}/workflows/cancel?workflowId={{workflowId}}&force=false
+Authorization: Bearer {{apiKey}}
+X-Tenant-Id: {{tenantId}}
+Accept: application/json
+
+###
+

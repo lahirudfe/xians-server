@@ -1,0 +1,738 @@
+using MongoDB.Bson;
+using MongoDB.Driver;
+using Shared.Data;
+using Shared.Data.Models;
+using Shared.Services;
+using Shared.Utils;
+
+namespace Shared.Repositories;
+
+public interface IUserRepository
+{
+    Task<PagedUserResult> GetAllUsersAsync(UserFilter filter);
+    Task<PagedUserResult> GetAllUsersByTenantAsync(UserFilter filter);
+    Task<List<User>> GetSystemAdminAsync();
+    Task<List<User>> GetUsersWithUnapprovedTenantAsync(string tenantId);
+    Task<List<User>> GetUsersByRoleAsync(string roleName, string tenantId);
+    Task<User?> GetByUserIdAsync(string userId);
+    Task<User?> GetByIdAsync(string id);
+    Task<User?> GetByUserEmailAsync(string email);
+    /// <summary>
+    /// Every record holding this address. More than one is legitimate: two identity providers can
+    /// each hold an account for the same person, and the provider subject rather than the address
+    /// is what a record is keyed on.
+    /// </summary>
+    Task<List<User>> GetAllByUserEmailAsync(string email);
+    /// <summary>
+    /// Folds every record holding <paramref name="email"/> into the one identity a credential that
+    /// names an address acts as. Null when no usable record exists.
+    /// </summary>
+    Task<EmailIdentityResolution?> ResolveEmailIdentityAsync(string email, string tenantId);
+    /// <summary>
+    /// Whether any record other than <paramref name="excludingUserId"/> holds this address. Callers
+    /// use it to keep a SysAdmin's address unique, since SysAdmin cannot be resolved from a shared one.
+    /// </summary>
+    Task<bool> IsEmailSharedAsync(string email, string excludingUserId);
+    /// <summary>
+    /// Resolves a user by <see cref="User.UserId"/> first, then by email when the value looks like an email.
+    /// Needed because identity can arrive as the canonical user id or as an email (bootstrapped users
+    /// and legacy API keys may store the email in place of the user id).
+    /// </summary>
+    Task<User?> GetByUserIdOrEmailAsync(string userIdOrEmail);
+    Task<List<TenantInfoDto>> GetUserTenantsAsync(string userId);
+    Task<List<string>> GetUserRolesAsync(string userId, string tenantId);
+    Task<User?> GetAnyUserAsync();
+    Task<bool> CreateAsync(User user);
+    Task<bool> UpdateAsync(string userId, User user);
+    Task<bool> UpdateAsyncById(string id, User user);
+    Task<bool> LockUserAsync(string userId, string reason, string lockedByUserId);
+    Task<bool> UnlockUserAsync(string userId);
+    Task<bool> IsLockedOutAsync(string userId);
+    Task<bool> IsSysAdmin(string userId);
+    /// <summary>
+    /// Sets only the fields supplied, leaving the rest of the record untouched. Unlike
+    /// <see cref="UpdateAsync"/>, which replaces the whole document, this cannot undo a change
+    /// another request made in the meantime — a tenant membership appended in parallel, say.
+    /// </summary>
+    Task<bool> UpdateProfileFieldsAsync(string userId, string? email, string? name);
+    Task<string?> PinProviderAuthorityIfUnsetAsync(string userId, string providerAuthority);
+    Task<bool> AddTenantRoleIfAbsentAsync(string userId, string tenantId, bool isApproved, IReadOnlyList<string> roles);
+    Task<bool> SetSysAdminAsync(string userId, bool isSysAdmin);
+    Task<bool> DeleteUser(string userId, string? tenantId = null);
+    Task<List<User>> SearchUsersAsync(string query, string? tenantId = null);
+}
+
+public class UserRepository : IUserRepository
+{
+    private readonly IMongoCollection<User> _users;
+    private readonly ILogger<UserRepository> _logger;
+    private readonly ITenantRepository _tenantRepository;
+
+    public UserRepository(IDatabaseService databaseService, ILogger<UserRepository> logger, ITenantRepository tenantRepository)
+    {
+        var database = databaseService.GetDatabaseAsync().Result;
+        _users = database.GetCollection<User>("users");
+        _logger = logger;
+        _tenantRepository = tenantRepository;
+    }
+
+    public async Task<PagedUserResult> GetAllUsersAsync(UserFilter filter)
+    {
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            var builder = Builders<User>.Filter;
+            var filters = new List<FilterDefinition<User>>();
+
+            // Filter by user type
+            switch (filter.Type)
+            {
+                case UserTypeFilter.ADMIN:
+                    filters.Add(builder.Eq(u => u.IsSysAdmin, true));
+                    break;
+                case UserTypeFilter.NON_ADMIN:
+                    filters.Add(builder.Eq(u => u.IsSysAdmin, false));
+                    break;
+                case UserTypeFilter.PARTICIPANT:
+                    filters.Add(builder.ElemMatch(u => u.TenantRoles,
+                        tr => tr.Roles.Contains(SystemRoles.TenantParticipant) && tr.IsApproved));
+                    break;
+                case UserTypeFilter.PARTICIPANT_ADMIN:
+                    filters.Add(builder.ElemMatch(u => u.TenantRoles,
+                        tr => tr.Roles.Contains(SystemRoles.TenantParticipantAdmin) && tr.IsApproved));
+                    break;
+                case UserTypeFilter.ALL:
+                default:
+                    // No additional filter
+                    break;
+            }
+
+            // Filter by tenant and/or tenant role. Combined into a single ElemMatch so both
+            // conditions must hold on the same membership.
+            if (!string.IsNullOrWhiteSpace(filter.Tenant) && !string.IsNullOrWhiteSpace(filter.Role))
+            {
+                var role = filter.Role;
+                filters.Add(builder.ElemMatch(u => u.TenantRoles,
+                    tr => tr.Tenant == filter.Tenant && tr.Roles.Contains(role)));
+            }
+            else if (!string.IsNullOrWhiteSpace(filter.Tenant))
+            {
+                filters.Add(builder.ElemMatch(u => u.TenantRoles, tr => tr.Tenant == filter.Tenant));
+            }
+            else if (!string.IsNullOrWhiteSpace(filter.Role))
+            {
+                var role = filter.Role;
+                filters.Add(builder.ElemMatch(u => u.TenantRoles, tr => tr.Roles.Contains(role)));
+            }
+
+            // Filter by explicit IsSysAdmin value (overrides UserTypeFilter.ADMIN/NON_ADMIN if both set)
+            if (filter.IsSysAdmin.HasValue)
+            {
+                filters.Add(builder.Eq(u => u.IsSysAdmin, filter.IsSysAdmin.Value));
+            }
+
+            // Filter by account enabled state (IsEnabled = !IsLockedOut)
+            if (filter.IsEnabled.HasValue)
+            {
+                filters.Add(builder.Eq(u => u.IsLockedOut, !filter.IsEnabled.Value));
+            }
+
+            // Search by name or email (case-insensitive, partial match)
+            if (!string.IsNullOrWhiteSpace(filter.Search))
+            {
+                var search = filter.Search.Trim();
+                var nameFilter = builder.Regex(u => u.Name, new MongoDB.Bson.BsonRegularExpression(search, "i"));
+                var emailFilter = builder.Regex(u => u.Email, new MongoDB.Bson.BsonRegularExpression(search, "i"));
+                filters.Add(builder.Or(nameFilter, emailFilter));
+            }
+
+            var mongoFilter = filters.Count > 0 ? builder.And(filters) : builder.Empty;
+
+            // Paging
+            int page = filter.Page > 0 ? filter.Page : 1;
+            int pageSize = filter.PageSize > 0 ? filter.PageSize : 20;
+            int skip = (page - 1) * pageSize;
+
+            var users = await _users
+                .Find(mongoFilter)
+                .Skip(skip)
+                .Limit(pageSize)
+                .ToListAsync();
+
+            var totalCount = await _users.CountDocumentsAsync(mongoFilter);
+
+            return new PagedUserResult
+            {
+                Users = users,
+                TotalCount = totalCount,
+            };
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "GetAllUsers");
+    }
+
+    public async Task<PagedUserResult> GetAllUsersByTenantAsync(UserFilter filter)
+    {
+        var builder = Builders<User>.Filter;
+        var filters = new List<FilterDefinition<User>>();
+
+        // Must filter by tenant for role-based filtering
+        if (string.IsNullOrWhiteSpace(filter.Tenant))
+            throw new ArgumentException("Tenant is required for role-based user filtering.");
+
+        // Include users whether or not their tenant membership is approved (IsApproved).
+        // The UI shows approval status; pending users must still appear for tenant admins to act on.
+        switch (filter.Type)
+        {
+            case UserTypeFilter.ADMIN:
+                filters.Add(builder.ElemMatch(u => u.TenantRoles,
+                    tr => tr.Tenant == filter.Tenant && tr.Roles.Contains(SystemRoles.TenantAdmin)));
+                break;
+
+            case UserTypeFilter.NON_ADMIN:
+                filters.Add(builder.ElemMatch(u => u.TenantRoles,
+                    tr => tr.Tenant == filter.Tenant && tr.Roles.Contains(SystemRoles.TenantUser)));
+                break;
+
+            case UserTypeFilter.PARTICIPANT:
+                filters.Add(builder.ElemMatch(u => u.TenantRoles,
+                    tr => tr.Tenant == filter.Tenant && tr.Roles.Contains(SystemRoles.TenantParticipant)));
+                break;
+            case UserTypeFilter.PARTICIPANT_ADMIN:
+                filters.Add(builder.ElemMatch(u => u.TenantRoles,
+                    tr => tr.Tenant == filter.Tenant && tr.Roles.Contains(SystemRoles.TenantParticipantAdmin)));
+                break;
+
+            case UserTypeFilter.PARTICIPANT_SCOPE:
+            {
+                var trFilter = Builders<TenantRole>.Filter.And(
+                    Builders<TenantRole>.Filter.Eq(tr => tr.Tenant, filter.Tenant),
+                    Builders<TenantRole>.Filter.AnyIn(
+                        tr => tr.Roles,
+                        new[] { SystemRoles.TenantParticipant, SystemRoles.TenantParticipantAdmin }));
+                filters.Add(builder.ElemMatch(u => u.TenantRoles, trFilter));
+                break;
+            }
+
+            case UserTypeFilter.ALL:
+            default:
+                filters.Add(builder.ElemMatch(u => u.TenantRoles,
+                    tr => tr.Tenant == filter.Tenant));
+                break;
+        }
+
+        // Filter by a specific tenant role within the tenant (in addition to the type filter).
+        if (!string.IsNullOrWhiteSpace(filter.Role))
+        {
+            var role = filter.Role;
+            filters.Add(builder.ElemMatch(u => u.TenantRoles,
+                tr => tr.Tenant == filter.Tenant && tr.Roles.Contains(role)));
+        }
+
+        // Search by name or email (case-insensitive, partial match)
+        if (!string.IsNullOrWhiteSpace(filter.Search))
+        {
+            var search = filter.Search.Trim();
+            var nameFilter = builder.Regex(u => u.Name, new MongoDB.Bson.BsonRegularExpression(search, "i"));
+            var emailFilter = builder.Regex(u => u.Email, new MongoDB.Bson.BsonRegularExpression(search, "i"));
+            filters.Add(builder.Or(nameFilter, emailFilter));
+        }
+
+        var mongoFilter = builder.And(filters);
+
+        // Paging
+        int page = filter.Page > 0 ? filter.Page : 1;
+        int pageSize = filter.PageSize > 0 ? filter.PageSize : 20;
+        int skip = (page - 1) * pageSize;
+
+        var users = await _users
+            .Find(mongoFilter)
+            .Skip(skip)
+            .Limit(pageSize)
+            .ToListAsync();
+
+        var totalCount = await _users.CountDocumentsAsync(mongoFilter);
+
+        return new PagedUserResult
+        {
+            Users = users,
+            TotalCount = totalCount,
+        };
+    }
+
+
+    public async Task<List<User>> GetSystemAdminAsync()
+    {
+        return await _users.Find(x => x.IsSysAdmin == true).ToListAsync();
+    }
+
+    public async Task<List<User>> GetUsersWithUnapprovedTenantAsync(string tenantId)
+    {
+        var filter = Builders<User>.Filter.And(
+            Builders<User>.Filter.ElemMatch(
+                u => u.TenantRoles,
+                tr => tr.Tenant == tenantId && tr.IsApproved == false
+            )
+        );
+        return await _users.Find(filter).ToListAsync();
+    }
+
+    public async Task<List<User>> GetUsersByRoleAsync(string roleName, string tenantId)
+    {
+        if (roleName == SystemRoles.SysAdmin)
+        {
+            return await _users.Find(u => u.IsSysAdmin).ToListAsync();
+        }
+
+        var filter = Builders<User>.Filter.ElemMatch(
+            u => u.TenantRoles,
+            tr => tr.Tenant == tenantId && tr.Roles.Contains(roleName)
+        );
+
+        return await _users.Find(filter).ToListAsync();
+    }
+
+    public async Task<User?> GetByIdAsync(string id)
+    {
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            return await _users.Find(x => x.Id == id).FirstOrDefaultAsync();
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "GetUserById");
+    }
+
+
+    public async Task<User?> GetByUserIdAsync(string userId)
+    {
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            return await _users.Find(x => x.UserId == userId).FirstOrDefaultAsync();
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "GetByUserId");
+    }
+
+    public async Task<User?> GetByUserEmailAsync(string email)
+    {
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            // Normalize email to lowercase (emails are stored in lowercase in DB)
+            var normalizedEmail = email.ToLowerInvariant();
+            return await _users.Find(x => x.Email == normalizedEmail).FirstOrDefaultAsync();
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "GetByUserEmail");
+    }
+
+    public async Task<List<User>> GetAllByUserEmailAsync(string email)
+    {
+        if (string.IsNullOrWhiteSpace(email))
+        {
+            return new List<User>();
+        }
+
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            // Normalize email to lowercase (emails are stored in lowercase in DB)
+            var normalizedEmail = email.ToLowerInvariant();
+            return await _users.Find(x => x.Email == normalizedEmail).ToListAsync();
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "GetAllByUserEmail");
+    }
+
+    public async Task<EmailIdentityResolution?> ResolveEmailIdentityAsync(string email, string tenantId)
+    {
+        var records = await GetAllByUserEmailAsync(email);
+        return EmailIdentityResolution.From(email, records, tenantId, _logger);
+    }
+
+    public async Task<bool> IsEmailSharedAsync(string email, string excludingUserId)
+    {
+        if (string.IsNullOrWhiteSpace(email))
+        {
+            return false;
+        }
+
+        var owners = await GetAllByUserEmailAsync(email);
+        return owners.Any(user => !string.Equals(user.UserId, excludingUserId, StringComparison.Ordinal));
+    }
+
+    public async Task<User?> GetByUserIdOrEmailAsync(string userIdOrEmail)
+    {
+        if (string.IsNullOrWhiteSpace(userIdOrEmail))
+            return null;
+
+        var user = await GetByUserIdAsync(userIdOrEmail);
+        if (user != null)
+            return user;
+
+        // Legacy API keys may store email in CreatedBy instead of the GUID user_id.
+        if (userIdOrEmail.Contains('@'))
+            return await GetByUserEmailAsync(userIdOrEmail);
+
+        return null;
+    }
+
+    public async Task<List<TenantInfoDto>> GetUserTenantsAsync(string userId)
+    {
+        var filter = Builders<User>.Filter.Eq(u => u.UserId, userId);
+        var projection = Builders<User>.Projection.Expression(u => u.TenantRoles);
+
+        var tenantRoles = await _users
+            .Find(filter)
+            .Project(projection)
+            .FirstOrDefaultAsync();
+
+        if (tenantRoles == null || !tenantRoles.Any())
+        {
+            return new List<TenantInfoDto>();
+        }
+
+        // Get approved tenant IDs from user's tenant roles
+        var approvedTenantIds = tenantRoles
+            .Where(x => x.IsApproved)
+            .Select(tr => tr.Tenant)
+            .ToList();
+
+        if (!approvedTenantIds.Any())
+        {
+            return new List<TenantInfoDto>();
+        }
+
+        // Validate that each tenant exists and is enabled (single batch query instead of N+1)
+        try
+        {
+            var tenants = await _tenantRepository.GetByTenantIdsAsync(approvedTenantIds);
+            return tenants
+                .Where(t => t != null && t.Enabled)
+                .Select(t => new TenantInfoDto { TenantId = t.TenantId, Name = t.Name })
+                .ToList();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error fetching tenants for user {UserId}", LogSanitizer.Sanitize(userId));
+            return new List<TenantInfoDto>();
+        }
+    }
+
+    public async Task<User?> GetAnyUserAsync()
+    {
+        return await _users.Find(_ => true).FirstOrDefaultAsync();
+    }
+
+    public async Task<List<string>> GetUserRolesAsync(string userId, string tenantId)
+    {
+        if (string.IsNullOrWhiteSpace(userId))
+            return new List<string>();
+
+        // The canonical id names one account and needs no folding. Checked first so a record whose
+        // UserId is itself an address — some providers issue one — still resolves to itself.
+        var user = await GetByUserIdAsync(userId);
+
+        if (user == null)
+        {
+            // No record is keyed on this value, so an address here names whoever holds it, which
+            // can be more than one account. Fold rather than taking whichever the collection scan
+            // returned first: SysAdmin is global, and one record holding it while another does not
+            // means nobody has accepted the two as the same person. The fold also drops disabled
+            // records before choosing, where picking first could land on one and report no roles
+            // while a live account holds the same address.
+            if (userId.Contains('@'))
+            {
+                var identity = await ResolveEmailIdentityAsync(userId, tenantId);
+                return identity?.Roles.ToList() ?? new List<string>();
+            }
+
+            return new List<string>();
+        }
+
+        // A disabled account carries nothing, matching what an address resolves to through
+        // EmailIdentityResolution. Without this a credential naming the id kept its roles after the
+        // account was turned off.
+        if (user.IsLockedOut)
+        {
+            _logger.LogWarning("No roles for {UserId}: the account is disabled",
+                LogSanitizer.RedactUserId(user.UserId));
+            return new List<string>();
+        }
+
+        // Only return roles for approved tenants. Copied, because SysAdmin is appended below and
+        // the record's own list would otherwise grow a role nobody wrote.
+        var tenantRole = user.TenantRoles.FirstOrDefault(tr => tr.Tenant == tenantId && tr.IsApproved);
+        var result = tenantRole?.Roles.ToList() ?? new List<string>();
+
+        if (user.IsSysAdmin)
+        {
+            result.Add(SystemRoles.SysAdmin);
+        }
+
+        return result;
+    }
+
+
+    public async Task<bool> CreateAsync(User user)
+    {
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            try
+            {
+                await _users.InsertOneAsync(user);
+                return true;
+            }
+            catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+            {
+                // The server names the violated index, and it is not always user_id: a unique index
+                // left behind by an earlier schema version collides here too, and Cosmos DB never
+                // drops unused indexes. Without the detail this reads as a harmless creation race.
+                _logger.LogWarning(ex, "Could not create user {UserId} - duplicate key: {WriteError}",
+                    LogSanitizer.RedactUserId(user.UserId), LogSanitizer.Sanitize(ex.WriteError?.Message));
+                return false;
+            }
+            // Anything else is left to propagate, as every other method here does. Catching it would
+            // sit inside the retry wrapper and convert the errors it exists to handle — Cosmos DB
+            // throttling above all — into a flat "could not create", unretried and indistinguishable
+            // from a real conflict.
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "CreateUser");
+    }
+
+    public async Task<bool> UpdateAsyncById(string id, User user)
+    {
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            user.UpdatedAt = DateTime.UtcNow;
+            var result = await _users.ReplaceOneAsync(x => x.Id == id, user);
+            return result.ModifiedCount > 0;
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "UpdateUserById");
+    }
+
+    public async Task<bool> UpdateAsync(string userId, User user)
+    {
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            user.UpdatedAt = DateTime.UtcNow;
+            var result = await _users.ReplaceOneAsync(x => x.UserId == userId, user);
+            return result.ModifiedCount > 0;
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "UpdateUser");
+    }
+
+    public async Task<bool> UpdateProfileFieldsAsync(string userId, string? email, string? name)
+    {
+        var updates = new List<UpdateDefinition<User>>();
+
+        if (email != null)
+        {
+            // Stored lowercase, matching the property setter on the model.
+            updates.Add(Builders<User>.Update.Set(x => x.Email, email.ToLowerInvariant()));
+        }
+
+        if (name != null)
+        {
+            updates.Add(Builders<User>.Update.Set(x => x.Name, name));
+        }
+
+        if (updates.Count == 0)
+        {
+            return false;
+        }
+
+        updates.Add(Builders<User>.Update.Set(x => x.UpdatedAt, DateTime.UtcNow));
+
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            var result = await _users.UpdateOneAsync(
+                x => x.UserId == userId, Builders<User>.Update.Combine(updates));
+            return result.ModifiedCount > 0;
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "UpdateUserProfileFields");
+    }
+
+    public async Task<bool> LockUserAsync(string userId, string reason, string lockedByUserId)
+    {
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            var update = Builders<User>.Update
+                .Set(x => x.IsLockedOut, true)
+                .Set(x => x.LockedOutReason, reason)
+                .Set(x => x.LockedOutAt, DateTime.UtcNow)
+                .Set(x => x.LockedOutBy, lockedByUserId);
+
+            var result = await _users.UpdateOneAsync(x => x.UserId == userId, update);
+            return result.ModifiedCount > 0;
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "LockUser");
+    }
+
+    public async Task<bool> UnlockUserAsync(string userId)
+    {
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            var update = Builders<User>.Update
+                .Set(x => x.IsLockedOut, false)
+                .Set(x => x.LockedOutReason, null)
+                .Set(x => x.LockedOutAt, null)
+                .Set(x => x.LockedOutBy, null);
+
+            var result = await _users.UpdateOneAsync(x => x.UserId == userId, update);
+            return result.ModifiedCount > 0;
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "UnlockUser");
+    }
+
+    public async Task<bool> IsLockedOutAsync(string userId)
+    {
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            var user = await _users.Find(x => x.UserId == userId)
+                .Project(x => new { x.IsLockedOut })
+                .FirstOrDefaultAsync();
+            return user?.IsLockedOut ?? false;
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "IsLockedOut");
+    }
+
+    public async Task<bool> IsSysAdmin(string userId)
+    {
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            var user = await _users.Find(x => x.UserId == userId)
+                .Project(x => new { x.IsSysAdmin })
+                .FirstOrDefaultAsync();
+            return user?.IsSysAdmin ?? false;
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "IsSysAdmin");
+    }
+
+    /// <summary>
+    /// Pins the user to <paramref name="providerAuthority"/> if they are not pinned yet, and returns
+    /// the authority they are pinned to afterwards (null when the user does not exist).
+    ///
+    /// The set is conditional on the field still being empty so that two concurrent first sign-ins
+    /// from different providers cannot both believe they won; the loser sees the winner's value and
+    /// is rejected by the caller.
+    /// </summary>
+    public async Task<string?> PinProviderAuthorityIfUnsetAsync(string userId, string providerAuthority)
+    {
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            var unpinned = Builders<User>.Filter.And(
+                Builders<User>.Filter.Eq(u => u.UserId, userId),
+                Builders<User>.Filter.Or(
+                    Builders<User>.Filter.Exists(u => u.ProviderAuthority, false),
+                    Builders<User>.Filter.Eq(u => u.ProviderAuthority, null),
+                    Builders<User>.Filter.Eq(u => u.ProviderAuthority, string.Empty)));
+
+            var update = Builders<User>.Update
+                .Set(u => u.ProviderAuthority, providerAuthority)
+                .Set(u => u.UpdatedAt, DateTime.UtcNow);
+
+            var pinned = await _users.FindOneAndUpdateAsync(
+                unpinned,
+                update,
+                new FindOneAndUpdateOptions<User> { ReturnDocument = ReturnDocument.After });
+
+            if (pinned != null)
+            {
+                return pinned.ProviderAuthority;
+            }
+
+            // No match: either already pinned, or the user does not exist.
+            var existing = await _users.Find(u => u.UserId == userId)
+                .Project(u => new { u.ProviderAuthority })
+                .FirstOrDefaultAsync();
+
+            return existing?.ProviderAuthority;
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "PinProviderAuthorityIfUnset");
+    }
+
+    /// <summary>
+    /// Records a membership of <paramref name="tenantId"/>, unless the user already has some
+    /// membership of it. An existing row is never altered: it may carry roles an admin granted, or
+    /// an approval they deliberately withheld.
+    ///
+    /// An unapproved membership grants nothing on its own — it exists so the user shows up in the
+    /// tenant's pending list for an admin to approve or ignore.
+    ///
+    /// Conditional on the server rather than read-then-write, because concurrent requests from the
+    /// same newly provisioned user would otherwise each append their own row.
+    /// </summary>
+    /// <returns>True when this call added the membership.</returns>
+    public async Task<bool> AddTenantRoleIfAbsentAsync(
+        string userId, string tenantId, bool isApproved, IReadOnlyList<string> roles)
+    {
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            var withoutTenant = Builders<User>.Filter.And(
+                Builders<User>.Filter.Eq(u => u.UserId, userId),
+                Builders<User>.Filter.Not(
+                    Builders<User>.Filter.ElemMatch(u => u.TenantRoles, tr => tr.Tenant == tenantId)));
+
+            var update = Builders<User>.Update
+                .Push(u => u.TenantRoles, new TenantRole
+                {
+                    Tenant = tenantId,
+                    Roles = roles.ToList(),
+                    IsApproved = isApproved
+                })
+                .Set(u => u.UpdatedAt, DateTime.UtcNow);
+
+            var result = await _users.UpdateOneAsync(withoutTenant, update);
+            return result.ModifiedCount > 0;
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "AddTenantRoleIfAbsent");
+    }
+
+    public async Task<bool> SetSysAdminAsync(string userId, bool isSysAdmin)
+    {
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            var update = Builders<User>.Update
+                .Set(x => x.IsSysAdmin, isSysAdmin)
+                .Set(x => x.UpdatedAt, DateTime.UtcNow);
+
+            var result = await _users.UpdateOneAsync(x => x.UserId == userId, update);
+            return result.ModifiedCount > 0;
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "SetSysAdmin");
+    }
+
+    public async Task<bool> DeleteUser(string userId, string? tenantId = null)
+    {
+        return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+        {
+            // First verify the user exists
+            var userFilter = Builders<User>.Filter.Eq(u => u.UserId, userId);
+            var user = await _users.Find(userFilter).FirstOrDefaultAsync();
+            
+            if (user == null)
+            {
+                _logger.LogWarning("User {UserId} not found", LogSanitizer.Sanitize(userId));
+                return false;
+            }
+
+            // Check if user belongs to the specified tenant (skip check if tenantId is null - SysAdmin action)
+            if (tenantId != null)
+            {
+                var belongsToTenant = user.TenantRoles.Any(tr => tr.Tenant == tenantId);
+                if (!belongsToTenant)
+                {
+                    _logger.LogWarning("User {UserId} does not belong to tenant {TenantId}. IDOR attempt detected.", LogSanitizer.Sanitize(userId), LogSanitizer.Sanitize(tenantId));
+                    return false;
+                }
+            }
+
+            // Delete the user
+            var deletedUser = await _users.DeleteOneAsync(userFilter);
+            return deletedUser.IsAcknowledged && deletedUser.DeletedCount > 0;
+        }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "DeleteUser");
+    }
+
+    public async Task<List<User>> SearchUsersAsync(string query, string? tenantId = null)
+    {
+        // Search users by email or name
+        var searchFilter = Builders<User>.Filter.Or(
+            Builders<User>.Filter.Regex(u => u.Email, new BsonRegularExpression(query, "i")),
+            Builders<User>.Filter.Regex(u => u.Name, new BsonRegularExpression(query, "i"))
+        );
+
+        // If tenantId is provided, filter by tenant (otherwise search all users - SysAdmin action)
+        FilterDefinition<User> combinedFilter;
+        if (tenantId != null)
+        {
+            var tenantFilter = Builders<User>.Filter.ElemMatch(
+                u => u.TenantRoles,
+                Builders<TenantRole>.Filter.Eq(tr => tr.Tenant, tenantId)
+            );
+            combinedFilter = Builders<User>.Filter.And(searchFilter, tenantFilter);
+        }
+        else
+        {
+            combinedFilter = searchFilter;
+        }
+
+        return await _users.Find(combinedFilter).Limit(20).ToListAsync();
+    }
+}

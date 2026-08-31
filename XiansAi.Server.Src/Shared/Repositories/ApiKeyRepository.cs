@@ -1,0 +1,263 @@
+using MongoDB.Driver;
+using MongoDB.Bson;
+using System.Security.Cryptography;
+using System.Text;
+using Shared.Data;
+using Shared.Data.Models;
+using Shared.Utils;
+
+namespace Shared.Repositories
+{
+    public interface IApiKeyRepository
+    {
+        Task<(string apiKey, ApiKey meta)> CreateAsync(string tenantId, string name, string createdBy, string? agentName = null, string? activationName = null, string? type = null, string? workflowName = null, string? participantId = null, int? timeoutInSeconds = null, string? webhookName = null);
+        Task<bool> RevokeAsync(string id, string tenantId);
+        Task<long> DeleteAllAsync();
+        Task<List<ApiKey>> GetByTenantAsync(string tenantId, bool hasRevoked=false);
+        Task<(string apiKey, ApiKey meta)?> RotateAsync(string id, string tenantId);
+        Task<ApiKey?> GetByIdAsync(string id, string tenantId);
+        Task<ApiKey?> GetByIdAsync(string id);
+        Task<ApiKey?> GetByRawKeyAsync(string rawKey, string tenantId);
+        Task<ApiKey?> GetByRawKeyAsync(string rawKey); // Overload without tenantId for authentication
+        Task<List<ApiKey>> GetByTenantAndTypeAsync(string tenantId, string type, string? agentName = null, string? activationName = null);
+    }
+
+    public class ApiKeyRepository : IApiKeyRepository
+    {
+        private readonly IMongoCollection<ApiKey> _collection;
+        private readonly ILogger<ApiKeyRepository> _logger;
+
+        public ApiKeyRepository(IDatabaseService databaseService, ILogger<ApiKeyRepository> logger)
+        {
+            var database = databaseService.GetDatabaseAsync().Result;
+            _collection = database.GetCollection<ApiKey>("api_keys");
+            _logger = logger;
+        }
+
+
+
+        public async Task<(string apiKey, ApiKey meta)> CreateAsync(string tenantId, string name, string createdBy, string? agentName = null, string? activationName = null, string? type = null, string? workflowName = null, string? participantId = null, int? timeoutInSeconds = null, string? webhookName = null)
+        {
+            return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+            {
+                try
+                {
+                    var apiKey = GenerateApiKey();
+                    var hashedKey = HashApiKey(apiKey);
+                    var now = DateTime.UtcNow;
+                    var doc = new ApiKey
+                    {
+                        Id = ObjectId.GenerateNewId().ToString(),
+                        TenantId = tenantId,
+                        Name = name,
+                        HashedKey = hashedKey,
+                        CreatedAt = now,
+                        CreatedBy = createdBy,
+                        RevokedAt = null,
+                        LastRotatedAt = null,
+                        AgentName = agentName,
+                        ActivationName = activationName,
+                        Type = type,
+                        WorkflowName = workflowName,
+                        ParticipantId = participantId,
+                        TimeoutInSeconds = timeoutInSeconds,
+                        WebhookName = webhookName
+                    };
+                    await _collection.InsertOneAsync(doc);
+                    return (apiKey, doc);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error creating API key for tenant {TenantId}", LogSanitizer.Sanitize(tenantId));
+                    throw;
+                }
+            }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "CreateApiKey");
+        }
+
+        public async Task<bool> RevokeAsync(string id, string tenantId)
+        {
+            return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+            {
+                try
+                {
+                    // Hard-delete so the (tenant_id, name) unique index frees the name for reuse.
+                    var result = await _collection.DeleteOneAsync(
+                        x => x.Id == id && x.TenantId == tenantId);
+                    return result.DeletedCount > 0;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error revoking API key {ApiKeyId} for tenant {TenantId}", LogSanitizer.Sanitize(id), LogSanitizer.Sanitize(tenantId));
+                    return false;
+                }
+            }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "RevokeApiKey");
+        }
+
+        public async Task<long> DeleteAllAsync()
+        {
+            return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+            {
+                try
+                {
+                    var result = await _collection.DeleteManyAsync(FilterDefinition<ApiKey>.Empty);
+                    return result.DeletedCount;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error deleting all API keys");
+                    throw;
+                }
+            }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "DeleteAllApiKeys");
+        }
+
+        public async Task<List<ApiKey>> GetByTenantAsync(string tenantId, bool hasRevoked = false)
+        {
+            return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+            {
+                try
+                {
+                    if (hasRevoked)
+                    {
+                        return await _collection.Find(x => x.TenantId == tenantId).ToListAsync();
+                    }
+                    return await _collection.Find(x => x.TenantId == tenantId && x.RevokedAt == null).ToListAsync();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error getting API keys for tenant {TenantId}", LogSanitizer.Sanitize(tenantId));
+                    return new List<ApiKey>();
+                }
+            }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "GetApiKeysByTenant");
+        }
+
+        public async Task<List<ApiKey>> GetByTenantAndTypeAsync(string tenantId, string type, string? agentName = null, string? activationName = null)
+        {
+            return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+            {
+                try
+                {
+                    return await _collection.Find(x =>
+                        x.TenantId == tenantId &&
+                        x.Type == type &&
+                        x.RevokedAt == null &&
+                        (string.IsNullOrWhiteSpace(agentName) || x.AgentName == agentName) &&
+                        (string.IsNullOrWhiteSpace(activationName) || x.ActivationName == activationName)).ToListAsync();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error getting API keys for tenant {TenantId} with type {Type}", LogSanitizer.Sanitize(tenantId), LogSanitizer.Sanitize(type));
+                    return new List<ApiKey>();
+                }
+            }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "GetApiKeysByTenantAndType");
+        }
+
+        public async Task<(string apiKey, ApiKey meta)?> RotateAsync(string id, string tenantId)
+        {
+            return await MongoRetryHelper.ExecuteWithRetryAsync<(string apiKey, ApiKey meta)?>(async () =>
+            {
+                try
+                {
+                    var apiKey = GenerateApiKey();
+                    var hashedKey = HashApiKey(apiKey);
+                    var now = DateTime.UtcNow;
+                    var update = Builders<ApiKey>.Update
+                        .Set(x => x.HashedKey, hashedKey)
+                        .Set(x => x.LastRotatedAt, now)
+                        .Set(x => x.RevokedAt, null);
+                    var result = await _collection.FindOneAndUpdateAsync(
+                        x => x.Id == id && x.TenantId == tenantId && x.RevokedAt == null,
+                        update,
+                        new FindOneAndUpdateOptions<ApiKey> { ReturnDocument = ReturnDocument.After });
+                    if (result == null) return ((string apiKey, ApiKey meta)?)null;
+                    return (apiKey, result);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error rotating API key {ApiKeyId} for tenant {TenantId}", LogSanitizer.Sanitize(id), LogSanitizer.Sanitize(tenantId));
+                    return ((string apiKey, ApiKey meta)?)null;
+                }
+            }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "RotateApiKey");
+        }
+
+        public async Task<ApiKey?> GetByIdAsync(string id, string tenantId)
+        {
+            return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+            {
+                try
+                {
+                    return await _collection.Find(x => x.Id == id && x.TenantId == tenantId).FirstOrDefaultAsync();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error getting API key {ApiKeyId} for tenant {TenantId}", LogSanitizer.Sanitize(id), LogSanitizer.Sanitize(tenantId));
+                    return null;
+                }
+            }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "GetApiKeyById");
+        }
+
+        public async Task<ApiKey?> GetByIdAsync(string id)
+        {
+            return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+            {
+                try
+                {
+                    return await _collection.Find(x => x.Id == id && x.RevokedAt == null).FirstOrDefaultAsync();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error getting API key {ApiKeyId}", LogSanitizer.Sanitize(id));
+                    return null;
+                }
+            }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "GetApiKeyByIdNoTenant");
+        }
+
+        public async Task<ApiKey?> GetByRawKeyAsync(string rawKey, string tenantId)
+        {
+            return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+            {
+                try
+                {
+                    var hashed = HashApiKey(rawKey);
+                    return await _collection.Find(x => x.HashedKey == hashed && x.TenantId == tenantId && x.RevokedAt == null).FirstOrDefaultAsync();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error getting API key by raw key for tenant {TenantId}", LogSanitizer.Sanitize(tenantId));
+                    return null;
+                }
+            }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "GetApiKeyByRawKey");
+        }
+
+        public async Task<ApiKey?> GetByRawKeyAsync(string rawKey)
+        {
+            return await MongoRetryHelper.ExecuteWithRetryAsync(async () =>
+            {
+                try
+                {
+                    var hashed = HashApiKey(rawKey);
+                    return await _collection.Find(x => x.HashedKey == hashed && x.RevokedAt == null).FirstOrDefaultAsync();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error getting API key by raw key");
+                    return null;
+                }
+            }, _logger, maxRetries: 3, baseDelayMs: 100, operationName: "GetApiKeyByRawKeyNoTenant");
+        }
+
+        private static string GenerateApiKey()
+        {
+            var bytes = new byte[32];
+            using var rng = RandomNumberGenerator.Create();
+            rng.GetBytes(bytes);
+            return ApiKey.KeyPrefix + Convert.ToBase64String(bytes).Replace("+", "-").Replace("/", "_").TrimEnd('=');
+        }
+
+        private static string HashApiKey(string apiKey)
+        {
+            using var sha256 = SHA256.Create();
+            var hash = sha256.ComputeHash(Encoding.UTF8.GetBytes(apiKey));
+            return Convert.ToBase64String(hash);
+        }
+    }
+}

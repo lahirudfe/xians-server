@@ -21,20 +21,20 @@ public interface IWebhookReceiverService
 
 public class WebhookReceiverService : IWebhookReceiverService
 {
-    private readonly ITemporalGatewayFactory _temporalGatewayFactory;
+    private readonly ITemporalClientFactory _temporalClientFactory;
     private readonly ITenantContext _tenantContext;
     private readonly IApiKeyRepository _apiKeyRepository;
     private readonly ILogger<WebhookReceiverService> _logger;
     private readonly IAgentService _agentService;
 
     public WebhookReceiverService(
-        ITemporalGatewayFactory temporalGatewayFactory,
+        ITemporalClientFactory temporalClientFactory,
         IAgentService agentService,
         ITenantContext tenantContext,
         IApiKeyRepository apiKeyRepository,
         ILogger<WebhookReceiverService> logger)
     {
-        _temporalGatewayFactory = temporalGatewayFactory ?? throw new ArgumentNullException(nameof(temporalGatewayFactory));
+        _temporalClientFactory = temporalClientFactory ?? throw new ArgumentNullException(nameof(temporalClientFactory));
         _agentService = agentService ?? throw new ArgumentNullException(nameof(agentService));
         _tenantContext = tenantContext ?? throw new ArgumentNullException(nameof(tenantContext));
         _apiKeyRepository = apiKeyRepository ?? throw new ArgumentNullException(nameof(apiKeyRepository));
@@ -68,7 +68,7 @@ public class WebhookReceiverService : IWebhookReceiverService
                 queryParams,
                 body,
                 _tenantContext,
-                _temporalGatewayFactory,
+                _temporalClientFactory,
                 _agentService);
 
             _logger.LogInformation(

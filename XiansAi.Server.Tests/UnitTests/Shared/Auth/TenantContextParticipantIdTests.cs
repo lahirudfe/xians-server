@@ -1,14 +1,12 @@
 using Microsoft.Extensions.Configuration;
-using Moq;
 using Shared.Auth;
-using Shared.Repositories;
 
 namespace Tests.UnitTests.Shared.Auth;
 
 public class TenantContextParticipantIdTests
 {
     private static TenantContext BuildContext(string loggedInUser) =>
-        new(new ConfigurationBuilder().Build(), Mock.Of<ITenantTemporalConfigRepository>())
+        new(new ConfigurationBuilder().Build())
         {
             TenantId = "acme",
             LoggedInUser = loggedInUser,

@@ -21,11 +21,11 @@ public static class SettingsEndpoints
             .WithTags("AgentAPI - Settings")
             .RequiresCertificate();
 
-        settingsGroup.MapGet("/flowserver", async (
+        settingsGroup.MapGet("/flowserver", (
             [FromServices] CertificateService certificateService) =>
         {
             // Get flow server settings
-            var settings = await certificateService.GetFlowServerSettingsAsync();
+            var settings = certificateService.GetFlowServerSettings();
             return Results.Ok(settings);
         })
         .WithName("Get Flow Server Information")

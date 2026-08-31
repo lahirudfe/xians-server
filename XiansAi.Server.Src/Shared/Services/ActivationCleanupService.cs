@@ -38,24 +38,20 @@ public interface IActivationCleanupService
     /// </summary>
     /// <param name="workflowIds">List of workflow IDs to cancel</param>
     /// <param name="tenantId">The tenant ID for getting the Temporal client</param>
-    /// <param name="agentName">The agent name for getting the Temporal client</param>
     /// <returns>Result with count of cancelled workflows</returns>
     Task<ServiceResult<WorkflowCleanupResult>> CancelWorkflowsAsync(
-        List<string> workflowIds,
-        string tenantId,
-        string agentName);
+        List<string> workflowIds, 
+        string tenantId);
 
     /// <summary>
     /// Deletes all schedules by their IDs.
     /// </summary>
     /// <param name="scheduleIds">List of schedule IDs to delete</param>
     /// <param name="tenantId">The tenant ID for getting the Temporal client</param>
-    /// <param name="agentName">The agent name for getting the Temporal client</param>
     /// <returns>Result with count of deleted schedules</returns>
     Task<ServiceResult<ScheduleCleanupResult>> DeleteSchedulesAsync(
-        List<string> scheduleIds,
-        string tenantId,
-        string agentName);
+        List<string> scheduleIds, 
+        string tenantId);
 
     /// <summary>
     /// Performs complete cleanup of workflows and schedules for an activation.
@@ -107,14 +103,14 @@ public class ActivationCleanupResult
 /// </summary>
 public class ActivationCleanupService : IActivationCleanupService
 {
-    private readonly ITemporalGatewayService _temporalGatewayService;
+    private readonly ITemporalClientService _temporalClientService;
     private readonly ILogger<ActivationCleanupService> _logger;
 
     public ActivationCleanupService(
-        ITemporalGatewayService temporalGatewayService,
+        ITemporalClientService temporalClientService,
         ILogger<ActivationCleanupService> logger)
     {
-        _temporalGatewayService = temporalGatewayService ?? throw new ArgumentNullException(nameof(temporalGatewayService));
+        _temporalClientService = temporalClientService ?? throw new ArgumentNullException(nameof(temporalClientService));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
@@ -132,6 +128,7 @@ public class ActivationCleanupService : IActivationCleanupService
                 "Searching for workflows with tenantId={TenantId}, agent={Agent}, idPostfix={IdPostfix}",
                 tenantId, agentName, idPostfix);
 
+            var client = await _temporalClientService.GetClientAsync(tenantId);
             var workflowIds = new List<string>();
 
             // Build query using search attributes, filtering for running workflows only
@@ -146,17 +143,14 @@ public class ActivationCleanupService : IActivationCleanupService
             var query = string.Join(" AND ", queryParts);
             _logger.LogDebug("Executing workflow query: {Query}", query);
 
-            await foreach (var client in _temporalGatewayService.GetClientsAsync(tenantId))
+            // Query only running workflows that match the criteria
+            await foreach (var workflow in client.ListWorkflowsAsync(query))
             {
-                // Query only running workflows that match the criteria
-                await foreach (var workflow in client.ListWorkflowsAsync(query))
+                if (!string.IsNullOrEmpty(workflow.Id))
                 {
-                    if (!string.IsNullOrEmpty(workflow.Id) && workflow.Id.StartsWith(tenantId + ":", StringComparison.Ordinal))
-                    {
-                        workflowIds.Add(workflow.Id);
-                        _logger.LogDebug("Found running workflow: {WorkflowId} with status {Status}",
-                            workflow.Id, workflow.Status);
-                    }
+                    workflowIds.Add(workflow.Id);
+                    _logger.LogDebug("Found running workflow: {WorkflowId} with status {Status}", 
+                        workflow.Id, workflow.Status);
                 }
             }
 
@@ -184,7 +178,8 @@ public class ActivationCleanupService : IActivationCleanupService
             _logger.LogInformation(
                 "Searching for schedules with tenantId={TenantId}, agent={Agent}, idPostfix={IdPostfix}",
                 tenantId, agentName, idPostfix);
-                
+
+            var client = await _temporalClientService.GetClientAsync(tenantId);
             var scheduleIds = new List<string>();
 
             // Build query for schedules using search attributes
@@ -203,18 +198,14 @@ public class ActivationCleanupService : IActivationCleanupService
                 Query = query 
             };
 
-            await foreach (var client in _temporalGatewayService.GetClientsAsync(tenantId))
+            await foreach (var schedule in client.ListSchedulesAsync(listOptions))
             {
-                await foreach (var schedule in client.ListSchedulesAsync(listOptions))
+                if (!string.IsNullOrEmpty(schedule.Id))
                 {
-                    if (!string.IsNullOrEmpty(schedule.Id) && schedule.Id.StartsWith(tenantId + ":", StringComparison.Ordinal))
-                    {
-                        scheduleIds.Add(schedule.Id);
-                        _logger.LogDebug("Found schedule: {ScheduleId}", schedule.Id);
-                    }
+                    scheduleIds.Add(schedule.Id);
+                    _logger.LogDebug("Found schedule: {ScheduleId}", schedule.Id);
                 }
             }
-
 
             _logger.LogInformation("Found {Count} schedules for activation", scheduleIds.Count);
             return ServiceResult<List<string>>.Success(scheduleIds);
@@ -231,9 +222,8 @@ public class ActivationCleanupService : IActivationCleanupService
     /// Cancels all running workflows by their IDs, then verifies and terminates any that remain running.
     /// </summary>
     public async Task<ServiceResult<WorkflowCleanupResult>> CancelWorkflowsAsync(
-        List<string> workflowIds,
-        string tenantId,
-        string agentName)
+        List<string> workflowIds, 
+        string tenantId)
     {
         var result = new WorkflowCleanupResult
         {
@@ -248,7 +238,7 @@ public class ActivationCleanupService : IActivationCleanupService
 
         try
         {
-            var client = await _temporalGatewayService.GetClientAsync(tenantId, agentName);
+            var client = await _temporalClientService.GetClientAsync(tenantId);
             var workflowsToVerify = new List<string>();
 
             // Step 1: Send cancellation requests to all running workflows
@@ -360,9 +350,8 @@ public class ActivationCleanupService : IActivationCleanupService
     /// Deletes all schedules by their IDs.
     /// </summary>
     public async Task<ServiceResult<ScheduleCleanupResult>> DeleteSchedulesAsync(
-        List<string> scheduleIds,
-        string tenantId,
-        string agentName)
+        List<string> scheduleIds, 
+        string tenantId)
     {
         var result = new ScheduleCleanupResult
         {
@@ -377,7 +366,7 @@ public class ActivationCleanupService : IActivationCleanupService
 
         try
         {
-            var client = await _temporalGatewayService.GetClientAsync(tenantId, agentName);
+            var client = await _temporalClientService.GetClientAsync(tenantId);
 
             foreach (var scheduleId in scheduleIds)
             {
@@ -460,8 +449,7 @@ public class ActivationCleanupService : IActivationCleanupService
             // Step 3: Cancel all workflows
             var cancelResult = await CancelWorkflowsAsync(
                 workflowsResult.Data,
-                activation.TenantId,
-                activation.AgentName);
+                activation.TenantId);
 
             if (cancelResult.IsSuccess && cancelResult.Data != null)
             {
@@ -477,8 +465,7 @@ public class ActivationCleanupService : IActivationCleanupService
             // Step 4: Delete all schedules
             var deleteResult = await DeleteSchedulesAsync(
                 schedulesResult.Data,
-                activation.TenantId,
-                activation.AgentName);
+                activation.TenantId);
 
             if (deleteResult.IsSuccess && deleteResult.Data != null)
             {

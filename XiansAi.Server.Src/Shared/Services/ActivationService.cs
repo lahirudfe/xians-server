@@ -66,6 +66,7 @@ public class ActivationService : IActivationService
         IAgentRepository agentRepository,
         IFlowDefinitionRepository flowDefinitionRepository,
         IWorkflowStarterService workflowStarterService,
+        ITemporalClientService temporalClientService,
         IActivationCleanupService cleanupService,
         IActivationValidationService activationValidationService,
         IWebhookEventPublisher webhookEventPublisher,

@@ -27,18 +27,18 @@ public interface IWorkflowCancelService
 
 public class WorkflowCancelService : IWorkflowCancelService
 {
-    private readonly ITemporalGatewayService _temporalGatewayService;
+    private readonly ITemporalClientFactory _temporalClientFactory;
     private readonly ITenantContext _tenantContext;
     private readonly IAgentRepository _agentRepository;
     private readonly ILogger<WorkflowCancelService> _logger;
 
     public WorkflowCancelService(
-        ITemporalGatewayService temporalGatewayService,
+        ITemporalClientFactory temporalClientFactory,
         ITenantContext tenantContext,
         IAgentRepository agentRepository,
         ILogger<WorkflowCancelService> logger)
     {
-        _temporalGatewayService = temporalGatewayService ?? throw new ArgumentNullException(nameof(temporalGatewayService));
+        _temporalClientFactory = temporalClientFactory;
         _tenantContext = tenantContext ?? throw new ArgumentNullException(nameof(tenantContext));
         _agentRepository = agentRepository ?? throw new ArgumentNullException(nameof(agentRepository));
         _logger = logger;
@@ -58,16 +58,7 @@ public class WorkflowCancelService : IWorkflowCancelService
                 return ServiceResult<WorkflowCancelResult>.BadRequest("WorkflowId is required");
             }
 
-            if (!WorkflowBelongsToCurrentTenant(workflowId))
-            {
-                _logger.LogWarning(
-                    "Rejected cancel for workflow {WorkflowId} that does not belong to tenant {TenantId}",
-                    LogSanitizer.Sanitize(workflowId),
-                    _tenantContext.TenantId);
-                return ServiceResult<WorkflowCancelResult>.Forbidden("Workflow does not belong to this tenant");
-            }
-
-            var client = await _temporalGatewayService.GetClientAsync(_tenantContext.TenantId, WorkflowIdentifier.GetAgentName(WorkflowIdentifier.GetWorkflowType(workflowId)));
+            var client = await _temporalClientFactory.GetClientAsync();
             var handle = client.GetWorkflowHandle(workflowId);
             
             var result = new WorkflowCancelResult();
@@ -117,40 +108,41 @@ public class WorkflowCancelService : IWorkflowCancelService
 
             _logger.LogInformation("Cancelling all running workflows for tenant {TenantId} with query: {Query}", tenantId, listQuery);
 
+            var client = await _temporalClientFactory.GetClientAsync();
             var result = new CancelAllWorkflowsResult();
 
             var workflowIds = new List<string>();
-
-            await foreach (var client in _temporalGatewayService.GetClientsAsync(tenantId))
+            await foreach (var workflow in client.ListWorkflowsAsync(listQuery))
             {
-                await foreach (var workflow in client.ListWorkflowsAsync(listQuery))
+                workflowIds.Add(workflow.Id);
+            }
+
+            _logger.LogInformation("Found {Count} running workflows to cancel for tenant {TenantId}", workflowIds.Count, tenantId);
+
+            foreach (var workflowId in workflowIds)
+            {
+                try
                 {
-                    if (!string.IsNullOrEmpty(workflow.Id) && workflow.Id.StartsWith(tenantId + ":", StringComparison.Ordinal))
+                    var handle = client.GetWorkflowHandle(workflowId);
+
+                    if (force)
                     {
-                        try
-                        {
-                            var handle = client.GetWorkflowHandle(workflow.Id);
-
-                            if (force)
-                            {
-                                await handle.TerminateAsync("Terminated by bulk cancel request");
-                            }
-                            else
-                            {
-                                await handle.CancelAsync();
-                            }
-
-                            result.CancelledWorkflowIds.Add(workflow.Id);
-                            result.CancelledCount++;
-
-                            _logger.LogInformation("Successfully {Action} workflow {WorkflowId}", force ? "terminated" : "cancelled", workflow.Id);
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogWarning(ex, "Failed to cancel workflow {WorkflowId}", workflow.Id);
-                            result.FailedWorkflowIds.Add(workflow.Id);
-                        }
+                        await handle.TerminateAsync("Terminated by bulk cancel request");
                     }
+                    else
+                    {
+                        await handle.CancelAsync();
+                    }
+
+                    result.CancelledWorkflowIds.Add(workflowId);
+                    result.CancelledCount++;
+
+                    _logger.LogInformation("Successfully {Action} workflow {WorkflowId}", force ? "terminated" : "cancelled", workflowId);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to cancel workflow {WorkflowId}", workflowId);
+                    result.FailedWorkflowIds.Add(workflowId);
                 }
             }
 
@@ -164,12 +156,5 @@ public class WorkflowCancelService : IWorkflowCancelService
             _logger.LogError(ex, "Error cancelling all workflows for tenant {TenantId}", _tenantContext.TenantId);
             return ServiceResult<CancelAllWorkflowsResult>.InternalServerError($"Error cancelling all workflows: {ex.Message}");
         }
-    }
-
-    private bool WorkflowBelongsToCurrentTenant(string workflowId)
-    {
-        var tenantId = _tenantContext.TenantId;
-        return !string.IsNullOrEmpty(tenantId)
-            && workflowId.StartsWith(tenantId + ":", StringComparison.Ordinal);
     }
 }

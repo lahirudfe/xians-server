@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using Shared.Repositories;
 using Shared.Services;
+using Shared.Providers;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Caching.Memory;
 using Shared.Providers.Auth.Auth0;
@@ -88,6 +89,7 @@ public static class SharedConfiguration
         // Singleton because the caches that populate it are scoped, and an index that went out of
         // scope with the request that wrote the entry could never evict it later.
         builder.Services.AddSingleton<IUserCacheIndex, UserCacheIndex>();
+        builder.Services.AddSingleton<ICacheInvalidationApplicator, CacheInvalidationApplicator>();
 
         // Register token validation cache
         builder.Services.AddScoped<ITokenValidationCache, MemoryTokenValidationCache>();
@@ -211,7 +213,6 @@ public static class SharedConfiguration
         builder.Services.AddScoped<IInvitationRepository, InvitationRepository>();
         builder.Services.AddScoped<ITenantRepository, TenantRepository>();
         builder.Services.AddScoped<ITenantOidcConfigRepository, TenantOidcConfigRepository>();
-        builder.Services.AddScoped<ITenantTemporalConfigRepository, TenantTemporalConfigRepository>();
         builder.Services.AddScoped<ISecretVaultRepository, SecretVaultRepository>();
         builder.Services.AddScoped<IUsageEventRepository, UsageEventRepository>();
         builder.Services.AddScoped<IActivationRepository, ActivationRepository>();
@@ -246,7 +247,6 @@ public static class SharedConfiguration
         builder.Services.AddScoped<IGlobalUserAdminService, GlobalUserAdminService>();
         builder.Services.AddScoped<ITenantParticipantUserService, TenantParticipantUserService>();
         builder.Services.AddScoped<ITenantOidcConfigService, TenantOidcConfigService>();
-        builder.Services.AddScoped<ITenantTemporalConfigService, TenantTemporalConfigService>();
         builder.Services.AddScoped<ISecretVaultService, SecretVaultService>();
         builder.Services.AddSingleton<ISecureEncryptionService, SecureEncryptionService>();
         builder.Services.AddSingleton<ITenantMetadataProtector, TenantMetadataProtector>();
